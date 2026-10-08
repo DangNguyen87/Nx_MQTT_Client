@@ -73,9 +73,14 @@ extern "C" {
 #define STRLEN(p)                   (sizeof(p) - 1)
 
 #define TOPIC_NAME                  "Temperature"
-#define NB_MESSAGE                  10                    /*  if NB_MESSAGE = 0, client will publish messages infinitely */
+#define NB_MESSAGE                  0                    /*  if NB_MESSAGE = 0, client will publish messages infinitely */
 
+//#define MOSQUITTO_MQTT_PUBLIC
+#ifdef MOSQUITTO_MQTT_PUBLIC
 #define MQTT_BROKER_NAME            "test.mosquitto.org" /* MQTT Server */
+#else
+#define LOCAL_SERVER_ADDRESS        (IP_ADDRESS(192, 168, 0, 104))
+#endif /* MOSQUITTO_MQTT_PUBLIC */
 
 #define MQTT_PORT                   NXD_MQTT_TLS_PORT
 
@@ -102,7 +107,7 @@ extern "C" {
 
 #define DEFAULT_TIMEOUT             5 * NX_IP_PERIODIC_RATE
 
-#define NX_APP_CABLE_CONNECTION_CHECK_PERIOD      (1 * NX_IP_PERIODIC_RATE)
+#define NX_APP_CABLE_CONNECTION_CHECK_PERIOD      (5 * NX_IP_PERIODIC_RATE)
 /* USER CODE END EC */
 /* The DEFAULT_PAYLOAD_SIZE should match with RxBuffLen configured via MX_ETH_Init */
 #ifndef DEFAULT_PAYLOAD_SIZE
