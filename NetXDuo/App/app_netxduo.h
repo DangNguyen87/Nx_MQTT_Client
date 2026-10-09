@@ -106,6 +106,7 @@ extern "C" {
 #define USER_DNS_ADDRESS            IP_ADDRESS(1, 1, 1, 1)   /* User should configure it with his DNS address */
 
 #define DEFAULT_TIMEOUT             5 * NX_IP_PERIODIC_RATE
+#define SNTP_CLIENT_REQUEST_TIMEOUT 10  /* 10s */
 
 #define NX_APP_CABLE_CONNECTION_CHECK_PERIOD      (5 * NX_IP_PERIODIC_RATE)
 /* USER CODE END EC */

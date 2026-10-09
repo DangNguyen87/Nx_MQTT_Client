@@ -46,8 +46,6 @@ NXD_MQTT_CLIENT MqttClient;
 NX_SNTP_CLIENT  SntpClient;
 static NX_DNS   DnsClient;
 
-TX_EVENT_FLAGS_GROUP     SntpFlags;
-
 ULONG   IpAddress;
 ULONG   NetMask;
 
@@ -262,15 +260,6 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr)
   ret = tx_thread_create(&AppSNTPThread, "App SNTP Thread", App_SNTP_Thread_Entry, 0, pointer, SNTP_CLIENT_THREAD_MEMORY,
                          SNTP_PRIORITY, SNTP_PRIORITY, TX_NO_TIME_SLICE, TX_DONT_START);
 
-  if (ret != TX_SUCCESS)
-  {
-    return NX_NOT_ENABLED;
-  }
-
-  /* Create the event flags. */
-  ret = tx_event_flags_create(&SntpFlags, "SNTP event flags");
-
-  /* Check for errors */
   if (ret != TX_SUCCESS)
   {
     return NX_NOT_ENABLED;
@@ -559,10 +548,9 @@ static UINT tls_setup_callback(NXD_MQTT_CLIENT *client_pt,
 static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_TIME *local_time)
 {
   NX_PARAMETER_NOT_USED(time_update_ptr);
-  //NX_PARAMETER_NOT_USED(local_time);
 
   printf("SNTP time update: %lu\n", local_time->seconds);
-  tx_event_flags_set(&SntpFlags, SNTP_UPDATE_EVENT, TX_OR);
+  current_time = local_time->seconds - EPOCH_TIME_DIFF;
 }
 
 /** @brief  SNTP Client thread entry.
@@ -572,21 +560,20 @@ static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_
 static VOID App_SNTP_Thread_Entry(ULONG thread_input)
 {
   UINT ret;
-  ULONG  fraction;
-  ULONG  events = 0;
-  UINT   server_status;
   NXD_ADDRESS sntp_server_ip;
 
   sntp_server_ip.nxd_ip_version = 4;
 
-  /* Look up SNTP Server address. */
-  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)SNTP_SERVER_NAME, &sntp_server_ip.nxd_ip_address.v4, DEFAULT_TIMEOUT);
-
-  /* Check for error. */
-  if (ret != NX_SUCCESS)
+  do
   {
-    Error_Handler();
+	  /* Look up SNTP Server address until success. */
+	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)SNTP_SERVER_NAME, &sntp_server_ip.nxd_ip_address.v4, DEFAULT_TIMEOUT);
+	  if (ret != NX_SUCCESS)
+	  {
+		tx_thread_sleep(DEFAULT_TIMEOUT);
+	  }
   }
+  while (ret != NX_SUCCESS);
 
   /* Create the SNTP Client */
   ret =  nx_sntp_client_create(&SntpClient, &NetXDuoEthIpInstance, 0, &NxAppPool, NULL, NULL, NULL);
@@ -616,95 +603,51 @@ static VOID App_SNTP_Thread_Entry(ULONG thread_input)
     Error_Handler();
   }
 
-  /* Wait for a server update event. */
-  tx_event_flags_get(&SntpFlags, SNTP_UPDATE_EVENT, TX_OR_CLEAR, &events, PERIODIC_CHECK_INTERVAL);
-
-  if (events == SNTP_UPDATE_EVENT)
+  do
   {
-    /* Check for valid SNTP server status. */
-    ret = nx_sntp_client_receiving_updates(&SntpClient, &server_status);
-
-    if ((ret != NX_SUCCESS) || (server_status == NX_FALSE))
-    {
-      /* We do not have a valid update. */
-      Error_Handler();
-    }
-    /* We have a valid update.  Get the SNTP Client time.  */
-    ret = nx_sntp_client_get_local_time_extended(&SntpClient, &current_time, &fraction, NX_NULL, 0);
-
+    ret = nx_sntp_client_request_unicast_time(&SntpClient, SNTP_CLIENT_REQUEST_TIMEOUT);
     if (ret != NX_SUCCESS)
     {
-      Error_Handler();
+    	tx_thread_sleep(DEFAULT_TIMEOUT);
     }
-    /* take off 70 years difference */
-    current_time -= EPOCH_TIME_DIFF;
-
   }
-  else
-  {
-    Error_Handler();
-  }
+  while (ret != NX_SUCCESS);
 
   /* start the MQTT client thread */
   tx_thread_resume(&AppMQTTClientThread);
 
 }
 
-static UINT connect_to_broker(void)
+static UINT connect_to_broker(ULONG server_addr)
 {
 	NXD_ADDRESS mqtt_server_ip;
 	UINT ret = NX_SUCCESS;
 
-	  mqtt_server_ip.nxd_ip_version = 4;
-	  printf("Connecting to broker\n");
+	mqtt_server_ip.nxd_ip_version = 4;
+	mqtt_server_ip.nxd_ip_address.v4 = server_addr;
+	printf("Connecting to broker\n");
 
-#ifdef MOSQUITTO_MQTT_PUBLIC
-	  /* Look up MQTT Server address. */
-	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)MQTT_BROKER_NAME,
-	                                &mqtt_server_ip.nxd_ip_address.v4, DEFAULT_TIMEOUT);
+	/* Start a secure connection to the server. */
+	ret = nxd_mqtt_client_secure_connect(&MqttClient, &mqtt_server_ip,
+			MQTT_PORT, tls_setup_callback,
+			MQTT_KEEP_ALIVE_TIMER, CLEAN_SESSION, NX_WAIT_FOREVER);
 
-	  /* Check status.  */
-	  if (ret != NX_SUCCESS)
-	  {
-	    Error_Handler();
-	  }
-#else
-	  mqtt_server_ip.nxd_ip_address.v4 = LOCAL_SERVER_ADDRESS;
-#endif
+	if (ret != NX_SUCCESS) {
+	    printf("MQTT client failed to connect to broker 0x%x.\n", ret);
+		return ret;
+	} else {
+		printf("MQTT client connected to broker.\n");
+	}
 
-	    /* Start a secure connection to the server. */
-	      ret = nxd_mqtt_client_secure_connect(&MqttClient, &mqtt_server_ip, MQTT_PORT, tls_setup_callback,
-	                                           MQTT_KEEP_ALIVE_TIMER, CLEAN_SESSION, NX_WAIT_FOREVER);
+	/* Subscribe to the topic with QoS level 1. */
+	ret = nxd_mqtt_client_subscribe(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME),
+			QOS1);
 
-	      if (ret != NX_SUCCESS)
-	      {
-#ifdef MOSQUITTO_MQTT_PUBLIC
-	    	printf("\nMQTT client failed to connect to broker < %s >.\n",
-	               MQTT_BROKER_NAME);
-#else
-	    	printf("\nMQTT client failed to connect to broker %d.\n", ret);
-#endif
-	        //Error_Handler();
-	    	return ret;
-	      }
-	      else
-	      {
-#ifdef MOSQUITTO_MQTT_PUBLIC
-	    	printf("\nMQTT client connected to broker < %s > at PORT %d :\n",MQTT_BROKER_NAME, MQTT_PORT);
-#else
-	    	printf("\nMQTT client connected to broker\n");
-#endif
-	      }
-
-	      /* Subscribe to the topic with QoS level 1. */
-	      ret = nxd_mqtt_client_subscribe(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME), QOS1);
-
-	      if (ret != NX_SUCCESS)
-	      {
-	        //Error_Handler();
-	    	return ret;
-	      }
-  return NX_SUCCESS;
+	if (ret != NX_SUCCESS) {
+		//Error_Handler();
+		return ret;
+	}
+	return NX_SUCCESS;
 }
 
 /**
@@ -718,6 +661,23 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
   UINT aRandom32bit;
   UINT remaining_msg = NB_MESSAGE;
   UINT unlimited_publish = NX_FALSE;
+  ULONG broker_addr;
+
+#ifdef MOSQUITTO_MQTT_PUBLIC
+  do
+  {
+	  /* Look up MQTT Server address until success. */
+	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)MQTT_BROKER_NAME,
+	                                &broker_addr, DEFAULT_TIMEOUT);
+	  if (ret != NX_SUCCESS)
+	  {
+		  tx_thread_sleep(DEFAULT_TIMEOUT);
+	  }
+  }
+  while (ret != NX_SUCCESS);
+#else
+	  broker_addr = LOCAL_SERVER_ADDRESS;
+#endif
 
   /* Create MQTT client instance. */
   ret = nxd_mqtt_client_create(&MqttClient, "my_client", CLIENT_ID_STRING, STRLEN(CLIENT_ID_STRING),
@@ -743,7 +703,7 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 	  	  (MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
 	  {
 		  // Todo: Retry to connect until connect to broker and subscribed topics.
-		  connect_to_broker();
+		  connect_to_broker(broker_addr);
 	  }
 
 	  if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
