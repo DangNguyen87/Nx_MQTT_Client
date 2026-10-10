@@ -618,6 +618,21 @@ static VOID App_SNTP_Thread_Entry(ULONG thread_input)
 
 }
 
+// MQTT client observation:
+//    - MQTT client status is CONNECTED even cable disconnected for a while.
+//      It changes status to DISCONNECTED after timeout period if cable still disconnected.
+//      If MQTT client status is CONNECTED when cable disconnected, nxd_mqtt_client_subscribe()
+//      and nxd_mqtt_client_publish() return no error to user. User can publish/subscribe topic
+//      unsuccessfully, but the error is not notified to user.
+//    - There is the case reconnecting to broker is unsuccessfully.
+//      + Publish some messages when MQTT client status is CONNECTED and cable disconnected.
+//      + MQTT client change status to DISCONNECTED and disconnect callback function called,
+//        reconnect to broker is unsuccessfully.
+//        --> Need to study MQTT client source code and identify the root cause.
+//            Maybe MQTT client state is corrupt if sending messages when cable disconnected.
+//    --> MQTT client state can be corrupt, consider solution to detect communication error with broker
+//        and restart SW using watchdog timer.
+
 static UINT connect_to_broker(ULONG server_addr)
 {
 	NXD_ADDRESS mqtt_server_ip;
