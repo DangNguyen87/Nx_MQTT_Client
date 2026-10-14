@@ -30,6 +30,7 @@
 /* USER CODE BEGIN Includes */
 #include "nx_ip.h"
 #include  MOSQUITTO_CERT_FILE
+#include "lwjson/lwjson.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,6 +66,9 @@ static CHAR crypto_metadata_client[11600];
 /* Define the TLS packet reassembly buffer. */
 UCHAR tls_packet_buffer[4000];
 ULONG current_time;
+
+static lwjson_token_t tokens[128];
+static lwjson_t lwjson;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -436,19 +440,19 @@ static VOID my_disconnect_func(NXD_MQTT_CLIENT *client_ptr)
 /* Declare the notify function. */
 static VOID my_notify_func(NXD_MQTT_CLIENT* client_ptr, UINT number_of_messages)
 {
-	UINT topic_length, message_length;
-	static UINT message_count = 0;
+//	UINT topic_length, message_length;
+//	static UINT message_count = 0;
 
   NX_PARAMETER_NOT_USED(client_ptr);
   NX_PARAMETER_NOT_USED(number_of_messages);
 
-  // tx_event_flags_set(&mqtt_app_flag, DEMO_MESSAGE_EVENT, TX_OR);
+  tx_event_flags_set(&mqtt_app_flag, DEMO_MESSAGE_EVENT, TX_OR);
 
-  nxd_mqtt_client_message_get(&MqttClient, topic_buffer, sizeof(topic_buffer), &topic_length,
-                                message_buffer, sizeof(message_buffer), &message_length);
-  printf("Message %d received: TOPIC = %s, MESSAGE = %s\n",
-  		 message_count + 1, topic_buffer, message_buffer);
-  message_count++;
+//  nxd_mqtt_client_message_get(&MqttClient, topic_buffer, sizeof(topic_buffer), &topic_length,
+//                                message_buffer, sizeof(message_buffer), &message_length);
+//  printf("Message %d received: TOPIC = %s, MESSAGE = %s\n",
+//  		 message_count + 1, topic_buffer, message_buffer);
+//  message_count++;
 
   return;
 }
@@ -635,6 +639,7 @@ static VOID App_SNTP_Thread_Entry(ULONG thread_input)
 
 static UINT connect_to_broker(ULONG server_addr)
 {
+	CHAR allDeviceTopic[128];
 	NXD_ADDRESS mqtt_server_ip;
 	UINT ret = NX_SUCCESS;
 
@@ -654,9 +659,10 @@ static UINT connect_to_broker(ULONG server_addr)
 		printf("MQTT client connected to broker.\n");
 	}
 
-	/* Subscribe to the topic with QoS level 1. */
-	ret = nxd_mqtt_client_subscribe(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME),
-			QOS1);
+	/* Subscribe to the all topics related to device with QoS level 1. */
+	snprintf(allDeviceTopic, STRLEN(allDeviceTopic), "c2d/%s/#", DEVICE_ID);
+	ret = nxd_mqtt_client_subscribe(&MqttClient, allDeviceTopic,
+			                        strlen(allDeviceTopic), QOS1);
 
 	if (ret != NX_SUCCESS) {
 		//Error_Handler();
@@ -674,9 +680,16 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 {
   UINT ret = NX_SUCCESS;
   UINT aRandom32bit;
+  ULONG events;
+  UINT topic_length, message_length;
   UINT remaining_msg = NB_MESSAGE;
   UINT unlimited_publish = NX_FALSE;
   ULONG broker_addr;
+  UINT message_count = 0;
+  CHAR cmp_topic[128];
+
+  /* Initialize and pass statically allocated tokens */
+  lwjson_init(&lwjson, tokens, LWJSON_ARRAYSIZE(tokens));
 
 #ifdef MOSQUITTO_MQTT_PUBLIC
   do
@@ -709,28 +722,129 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
   /* Set the receive notify function. */
   nxd_mqtt_client_receive_notify_set(&MqttClient, my_notify_func);
 
+  /* Create an MQTT flag */
+  ret = tx_event_flags_create(&mqtt_app_flag, "my app event");
+  if (ret != TX_SUCCESS)
+  {
+    Error_Handler();
+  }
+  connect_to_broker(broker_addr);
+
   if (NB_MESSAGE ==0)
     unlimited_publish = NX_TRUE;
 
   while(unlimited_publish || remaining_msg)
   {
-	  if ((MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&
-	  	  (MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
+//	  if ((MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&
+//	  	  (MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
+//	  {
+//		  // Todo: Retry to connect until connect to broker and subscribed topics.
+//		  connect_to_broker(broker_addr);
+//	  }
+//
+//	  if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
+//	  {
+//	  	  aRandom32bit = message_generate();
+//
+//	  	  snprintf(message, STRLEN(message), "%u", aRandom32bit);
+//
+//	  	  /* Publish a message with QoS Level 1. */
+//	  	  ret = nxd_mqtt_client_publish(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME),
+//                                  (CHAR*)message, STRLEN(message), NX_TRUE, QOS1, NX_WAIT_FOREVER);
+//	  }
+	  /* wait for the broker to publish the message. */
+	  tx_event_flags_get(&mqtt_app_flag, DEMO_ALL_EVENTS, TX_OR_CLEAR, &events, TX_WAIT_FOREVER);
+
+	  /* check event received */
+	  if(events & DEMO_MESSAGE_EVENT)
 	  {
-		  // Todo: Retry to connect until connect to broker and subscribed topics.
-		  connect_to_broker(broker_addr);
+		/* get message from the broker */
+		ret = nxd_mqtt_client_message_get(&MqttClient, topic_buffer, sizeof(topic_buffer), &topic_length,
+										  message_buffer, sizeof(message_buffer), &message_length);
+		if(ret == NXD_MQTT_SUCCESS)
+		{
+		  printf("Message %d received: TOPIC = %s, MESSAGE = %s\n", message_count + 1, topic_buffer, message_buffer);
+		  if (lwjson_parse_ex(&lwjson, (CHAR *)message_buffer, message_length) == lwjsonOK)
+		  {
+			  const lwjson_token_t* top_obj;
+			  // Device receive command message
+			  snprintf(cmp_topic, STRLEN(cmp_topic), "c2d/%s/command", DEVICE_ID);
+			  if (strcmp((CHAR *)topic_buffer, cmp_topic) == 0)
+			  {
+				  /* Get very first token as top object */
+				  top_obj = lwjson_get_first_token(&lwjson);
+				  if (top_obj->type == LWJSON_TYPE_OBJECT)
+				  {
+					  const lwjson_token_t* tk_name;
+					  const lwjson_token_t* tk_led_type;
+
+					  // Find command name
+					  tk_name = lwjson_find(&lwjson, "name");
+					  if ((tk_name != NULL) && (tk_name->type == LWJSON_TYPE_STRING))
+					  {
+						  //printf("Token: %.*s\n", (int)tk_name->token_name_len, tk_name->token_name);
+						  //printf("Value: %.*s\n", (int)tk_name->u.str.token_value_len, tk_name->u.str.token_value);
+						  if ((strncmp(tk_name->u.str.token_value, "turn_on_led", tk_name->u.str.token_value_len) == 0) &&
+							  (tk_name->u.str.token_value_len == strlen("turn_on_led")))
+						  {
+							  // Find LED type
+							  tk_led_type = lwjson_find(&lwjson, "type");
+							  if ((tk_led_type != NULL) && (tk_led_type->type == LWJSON_TYPE_STRING))
+							  {
+								  if ((strncmp(tk_led_type->u.str.token_value, "green", tk_led_type->u.str.token_value_len) == 0) &&
+									  (tk_led_type->u.str.token_value_len == strlen("green")))
+								  {
+									  HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_RESET);
+								  }
+								  else if ((strncmp(tk_led_type->u.str.token_value, "red", tk_led_type->u.str.token_value_len) == 0) &&
+										   (tk_led_type->u.str.token_value_len == strlen("red")))
+								  {
+									  HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_RESET);
+								  }
+								  else
+								  {
+									  printf("Unknown led type\n");
+								  }
+							  }
+						  }
+						  else if ((strncmp(tk_name->u.str.token_value, "turn_off_led", tk_name->u.str.token_value_len) == 0) &&
+								   (tk_name->u.str.token_value_len == strlen("turn_off_led")))
+						  {
+							  if ((strncmp(tk_led_type->u.str.token_value, "green", tk_led_type->u.str.token_value_len) == 0) &&
+								  (tk_led_type->u.str.token_value_len == strlen("green")))
+							  {
+								  HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_SET);
+							  }
+							  else if ((strncmp(tk_led_type->u.str.token_value, "red", tk_led_type->u.str.token_value_len) == 0) &&
+									   (tk_led_type->u.str.token_value_len == strlen("red")))
+							  {
+								  HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_SET);
+							  }
+							  else
+							  {
+								  printf("Unknown led type\n");
+							  }
+						  }
+						  else
+						  {
+							  printf("Unknown command\n");
+						  }
+					  }
+					  else
+					  {
+						  printf("Not found command name\n");
+					  }
+				  }
+			  }
+		  }
+		}
+		else
+		{
+		  Error_Handler();
+		}
+		message_count++;
 	  }
 
-	  if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
-	  {
-	  	  aRandom32bit = message_generate();
-
-	  	  snprintf(message, STRLEN(message), "%u", aRandom32bit);
-
-	  	  /* Publish a message with QoS Level 1. */
-	  	  ret = nxd_mqtt_client_publish(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME),
-                                  (CHAR*)message, STRLEN(message), NX_TRUE, QOS1, NX_WAIT_FOREVER);
-	  }
 
     /* Delay 5s between each pub */
     tx_thread_sleep(500);

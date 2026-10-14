@@ -119,6 +119,8 @@ extern "C" {
 #define DEFAULT_ARP_CACHE_SIZE    1024
 #endif
 
+#define DEVICE_ID                 "abc123456"
+
 /* Exported macro ------------------------------------------------------------*/
 /* USER CODE BEGIN EM */
 #define PRINT_IP_ADDRESS(addr)           do { \
