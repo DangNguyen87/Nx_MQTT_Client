@@ -31,6 +31,7 @@
 #include "nx_ip.h"
 #include  MOSQUITTO_CERT_FILE
 #include "lwjson/lwjson.h"
+#include "lwjson/lwjson_serializer.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,6 +39,7 @@
 extern RNG_HandleTypeDef hrng;
 
 TX_THREAD AppMQTTClientThread;
+TX_THREAD AppTelemetryDataThread;
 TX_THREAD AppSNTPThread;
 TX_THREAD AppLinkThread;
 
@@ -97,6 +99,7 @@ static VOID ip_address_change_notify_callback(NX_IP *ip_instance, VOID *ptr);
 static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input);
 static VOID App_SNTP_Thread_Entry(ULONG thread_input);
 static VOID App_Link_Thread_Entry(ULONG thread_input);
+static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input);
 
 static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_TIME *local_time);
 static ULONG nx_secure_tls_session_time_function(void);
@@ -283,6 +286,20 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr)
   {
     return NX_NOT_ENABLED;
   }
+
+  /* Allocate the memory for MQTT telemetry data thread   */
+	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
+	{
+	  return TX_POOL_ERROR;
+	}
+	/* create the MQTT client thread */
+	  ret = tx_thread_create(&AppTelemetryDataThread, "App Telemetry Data Thread", App_Telemetry_Data_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
+							 MQTT_PRIORITY + 1, MQTT_PRIORITY + 1, TX_NO_TIME_SLICE, TX_DONT_START);
+
+	  if (ret != TX_SUCCESS)
+	  {
+		return NX_NOT_ENABLED;
+	  }
 
   /* Allocate the memory for Link thread   */
   if (tx_byte_allocate(byte_pool, (VOID **) &pointer,2 *  DEFAULT_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
@@ -671,6 +688,109 @@ static UINT connect_to_broker(ULONG server_addr)
 	return NX_SUCCESS;
 }
 
+static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input)
+{
+	lwjson_serializer_t serializer;
+	size_t outputBytes = 0;
+	UINT aRandom32bit;
+	CHAR telemetry_topic[NXD_MQTT_MAX_TOPIC_NAME_LENGTH];
+	CHAR serialized_json[NXD_MQTT_MAX_MESSAGE_LENGTH];
+	lwjsonr_t res;
+
+	while (1)
+	{
+		if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
+		{
+			snprintf(telemetry_topic, NXD_MQTT_MAX_TOPIC_NAME_LENGTH,
+					 "d2c/%s/data", DEVICE_ID);
+			aRandom32bit = message_generate();
+
+			/* Initialize serializer with output buffer */
+			res = lwjson_serializer_init(&serializer, serialized_json,
+					                     NXD_MQTT_MAX_MESSAGE_LENGTH);
+			if (res != lwjsonOK) {
+				printf("Failed to initialize serializer: %d\r\n", res);
+				return;
+			}
+
+			/* Start root object */
+			res = lwjson_serializer_start_object(&serializer, NULL, 0);
+			if (res != lwjsonOK) {
+				printf("Failed to start object: %d\r\n", res);
+				return;
+			}
+
+			res = lwjson_serializer_add_uint(&serializer, "Temperature", strlen("Temperature"),
+					                         aRandom32bit);
+			if (res != lwjsonOK) {
+				printf("Failed to add Temperature data: %d\n", res);
+				return;
+			}
+
+//			res = lwjson_serializer_add_string(&serializer, "Temperature", strlen("Temperature"),
+//					                           data_str, strlen(data_str));
+//			if (res != lwjsonOK) {
+//				printf("Failed to add Temperature data: %d\n", res);
+//				return;
+//			}
+
+//			/* Serialize led status */
+//			if (HAL_GPIO_ReadPin(GPIOC, LED_GREEN_Pin))
+//			{
+//				led_state = 0;
+//			}
+//			else
+//			{
+//				led_state = 1;
+//			}
+//			res = lwjson_serializer_add_int(&serializer, "green_led", strlen("green_led"),
+//					                        led_state);
+//			if (res != lwjsonOK) {
+//				printf("Failed to add green led status: %d\n", res);
+//				return;
+//			}
+//
+//			if (HAL_GPIO_ReadPin(GPIOC, LED_RED_Pin))
+//			{
+//				led_state = 0;
+//			}
+//			else
+//			{
+//				led_state = 1;
+//			}
+//			res = lwjson_serializer_add_int(&serializer, "red_led", strlen("red_led"),
+//					                        led_state);
+//			if (res != lwjsonOK) {
+//				printf("Failed to add red led status: %d\n", res);
+//				return;
+//			}
+
+			/* End root object */
+			res = lwjson_serializer_end_object(&serializer);
+			if (res != lwjsonOK) {
+				printf("Failed to end object: %d\n", res);
+				return;
+			}
+
+			res = lwjson_serializer_finalize(&serializer, &outputBytes);
+			if (res != lwjsonOK) {
+				printf("Failed to finalize serializer: %d\n", res);
+				return;
+			}
+			/* Ensure null termination */
+			serialized_json[outputBytes] = '\0';
+			printf("Serialize string: %s\n", serialized_json);
+
+			nxd_mqtt_client_publish(&MqttClient, telemetry_topic,
+									strlen(telemetry_topic),
+								    (CHAR*)serialized_json, outputBytes,
+									NX_TRUE, QOS1, NX_WAIT_FOREVER);
+		}
+		// Send data every 10s.
+		tx_thread_sleep(1000);
+	}
+}
+
 /**
 * @brief  MQTT Client thread entry.
 * @param thread_input: ULONG user argument used by the thread entry
@@ -679,7 +799,6 @@ static UINT connect_to_broker(ULONG server_addr)
 static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 {
   UINT ret = NX_SUCCESS;
-  UINT aRandom32bit;
   ULONG events;
   UINT topic_length, message_length;
   UINT remaining_msg = NB_MESSAGE;
@@ -729,6 +848,7 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
     Error_Handler();
   }
   connect_to_broker(broker_addr);
+  tx_thread_resume(&AppTelemetryDataThread);
 
   if (NB_MESSAGE ==0)
     unlimited_publish = NX_TRUE;
