@@ -898,16 +898,19 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
    * Should use periodic report message for device online/offline detection.
    *
    * Observed will message behavior with Mosquitto broker:
-   * - Will message will be published after 1.5 times keep alive period (set when connect to broker).
-   * - If device reconnect (resends CONNECT message) to broker within keep alive period,
+   * - Will message will be published after (1.5 x keep alive) period (set when connect to broker).
+   * - If device reconnect (resends CONNECT message) to broker within (1.5 x keep alive) period,
    *   user receive unexpected will message.
-   * - If device reconnect (resends CONNECT message) to broker after keep alive period,
+   * - If device reconnect (resends CONNECT message) to broker after (1.5 x keep alive) period,
    *   broker will not publish will message.
    */
   snprintf(cmp_topic, STRLEN(cmp_topic), "d2c/%s/status", DEVICE_ID);
   nxd_mqtt_client_will_message_set(&MqttClient, (UCHAR*)cmp_topic, strlen(cmp_topic),
 		                           (UCHAR*)"offline", strlen("offline"), NX_FALSE, QOS1);
 #endif
+
+  nxd_mqtt_client_login_set(&MqttClient, DEVICE_ID, strlen(DEVICE_ID),
+		                    DEVICE_TOKEN, strlen(DEVICE_TOKEN));
 
   /* Register the disconnect notification function. */
   nxd_mqtt_client_disconnect_notify_set(&MqttClient, my_disconnect_func);

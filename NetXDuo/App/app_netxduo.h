@@ -119,7 +119,8 @@ extern "C" {
 #define DEFAULT_ARP_CACHE_SIZE    1024
 #endif
 
-#define DEVICE_ID                 "abc123456"
+#define DEVICE_ID                 "6ad04be599d793e64d265b72"
+#define DEVICE_TOKEN              "111111"
 
 /* Exported macro ------------------------------------------------------------*/
 /* USER CODE BEGIN EM */
