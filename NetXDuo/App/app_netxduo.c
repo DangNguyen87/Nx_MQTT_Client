@@ -720,7 +720,7 @@ static void send_device_report(void)
 		nxd_mqtt_client_publish(&MqttClient, report_topic,
 								strlen(report_topic),
 								(CHAR*)serialized_json, outputBytes,
-								NX_TRUE, QOS1, NX_WAIT_FOREVER);
+								NX_FALSE, QOS1, NX_WAIT_FOREVER);
 	}
 }
 
@@ -842,7 +842,7 @@ static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input)
 			nxd_mqtt_client_publish(&MqttClient, telemetry_topic,
 									strlen(telemetry_topic),
 								    (CHAR*)serialized_json, outputBytes,
-									NX_TRUE, QOS1, NX_WAIT_FOREVER);
+									NX_FALSE, QOS1, NX_WAIT_FOREVER);
 		}
 		// Send data every 10s.
 		tx_thread_sleep(1000);
@@ -885,13 +885,29 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 #endif
 
   /* Create MQTT client instance. */
-  ret = nxd_mqtt_client_create(&MqttClient, "my_client", CLIENT_ID_STRING, STRLEN(CLIENT_ID_STRING),
+  ret = nxd_mqtt_client_create(&MqttClient, "my_client", DEVICE_ID, STRLEN(DEVICE_ID),
                                &NetXDuoEthIpInstance, &NxAppPool, (VOID*)mqtt_client_stack, MQTT_CLIENT_STACK_SIZE,
                                MQTT_THREAD_PRIORTY, NX_NULL, 0);
   if (ret != NX_SUCCESS)
   {
     Error_Handler();
   }
+
+#if 0
+  /**
+   * Should use periodic report message for device online/offline detection.
+   *
+   * Observed will message behavior with Mosquitto broker:
+   * - Will message will be published after 1.5 times keep alive period (set when connect to broker).
+   * - If device reconnect (resends CONNECT message) to broker within keep alive period,
+   *   user receive unexpected will message.
+   * - If device reconnect (resends CONNECT message) to broker after keep alive period,
+   *   broker will not publish will message.
+   */
+  snprintf(cmp_topic, STRLEN(cmp_topic), "d2c/%s/status", DEVICE_ID);
+  nxd_mqtt_client_will_message_set(&MqttClient, (UCHAR*)cmp_topic, strlen(cmp_topic),
+		                           (UCHAR*)"offline", strlen("offline"), NX_FALSE, QOS1);
+#endif
 
   /* Register the disconnect notification function. */
   nxd_mqtt_client_disconnect_notify_set(&MqttClient, my_disconnect_func);
@@ -914,23 +930,6 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 
   while(unlimited_publish || remaining_msg)
   {
-//	  if ((MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&
-//	  	  (MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
-//	  {
-//		  // Todo: Retry to connect until connect to broker and subscribed topics.
-//		  connect_to_broker(broker_addr);
-//	  }
-//
-//	  if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
-//	  {
-//	  	  aRandom32bit = message_generate();
-//
-//	  	  snprintf(message, STRLEN(message), "%u", aRandom32bit);
-//
-//	  	  /* Publish a message with QoS Level 1. */
-//	  	  ret = nxd_mqtt_client_publish(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME),
-//                                  (CHAR*)message, STRLEN(message), NX_TRUE, QOS1, NX_WAIT_FOREVER);
-//	  }
 	  /* wait for the broker to publish the message. */
 	  tx_event_flags_get(&mqtt_app_flag, DEMO_ALL_EVENTS, TX_OR_CLEAR, &events, TX_WAIT_FOREVER);
 
@@ -946,9 +945,11 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 		  if (lwjson_parse_ex(&lwjson, (CHAR *)message_buffer, message_length) == lwjsonOK)
 		  {
 			  const lwjson_token_t* top_obj;
-			  // Device receive command message
+
+			  // Device receive control command message
 			  snprintf(cmp_topic, STRLEN(cmp_topic), "c2d/%s/command", DEVICE_ID);
-			  if (strcmp((CHAR *)topic_buffer, cmp_topic) == 0)
+			  if ((strncmp((CHAR *)topic_buffer, cmp_topic, topic_length) == 0) &&
+				  (strlen(cmp_topic) == topic_length))
 			  {
 				  /* Get very first token as top object */
 				  top_obj = lwjson_get_first_token(&lwjson);
@@ -1014,6 +1015,39 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 						  printf("Not found command name\n");
 					  }
 				  }
+				  continue;
+			  }
+
+			  // Device receive status report request
+			  snprintf(cmp_topic, STRLEN(cmp_topic), "c2d/%s/report", DEVICE_ID);
+			  if ((strncmp((CHAR *)topic_buffer, cmp_topic, topic_length) == 0) &&
+				  (strlen(cmp_topic) == topic_length))
+			  {
+				  /* Get very first token as top object */
+				  top_obj = lwjson_get_first_token(&lwjson);
+				  if (top_obj->type == LWJSON_TYPE_OBJECT)
+				  {
+					  const lwjson_token_t* tk_topic;
+					  const lwjson_token_t* tk_topic_element;
+
+					  // Find topic
+					  tk_topic = lwjson_find(&lwjson, "topic");
+					  if ((tk_topic != NULL) && (tk_topic->type == LWJSON_TYPE_ARRAY))
+					  {
+						  for (tk_topic_element = lwjson_get_first_child(tk_topic); tk_topic_element != NULL; tk_topic_element = tk_topic_element->next)
+						  {
+							  // Report device status
+							  if ((tk_topic_element->type == LWJSON_TYPE_STRING) &&
+								  (strncmp(tk_topic_element->u.str.token_value, "property", tk_topic_element->u.str.token_value_len) == 0) &&
+								  (strlen("property") == tk_topic_element->u.str.token_value_len))
+							  {
+								  send_device_report();
+							  }
+						  }
+					  }
+
+				  }
+				  continue;
 			  }
 		  }
 		}
@@ -1030,7 +1064,7 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
   }
 
 	/* send an empty message at the end of the session to avoid the "Retain" message behavior */
-  ret = nxd_mqtt_client_publish(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME), NULL, 0, NX_TRUE, QOS1, NX_WAIT_FOREVER);
+  ret = nxd_mqtt_client_publish(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME), NULL, 0, NX_FALSE, QOS1, NX_WAIT_FOREVER);
 
   if (ret != NX_SUCCESS)
   {

@@ -68,7 +68,7 @@ extern "C" {
 #define MQTT_CLIENT_STACK_SIZE      1024 * 10
 #define CLIENT_ID_STRING            "MQTT_client_ID"
 #define MQTT_THREAD_PRIORTY         2
-#define MQTT_KEEP_ALIVE_TIMER       30000                /* Define the MQTT keep alive timer for 5 minutes */
+#define MQTT_KEEP_ALIVE_TIMER       300                /* Define the MQTT keep alive timer for 5 minutes */
 #define CLEAN_SESSION               NX_TRUE
 #define STRLEN(p)                   (sizeof(p) - 1)
 
