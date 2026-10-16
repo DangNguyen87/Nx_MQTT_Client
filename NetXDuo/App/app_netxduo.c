@@ -43,6 +43,7 @@ TX_THREAD AppTelemetryDataThread;
 TX_THREAD AppSNTPThread;
 TX_THREAD AppLinkThread;
 TX_THREAD AppDeviceReportThread;
+TX_THREAD AppMqttReconnectThread;
 TX_QUEUE  MsgQueueOne;
 
 NXD_MQTT_CLIENT MqttClient;
@@ -101,6 +102,7 @@ static VOID App_SNTP_Thread_Entry(ULONG thread_input);
 static VOID App_Link_Thread_Entry(ULONG thread_input);
 static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input);
 static VOID App_Device_Report_Thread_Entry(ULONG thread_input);
+static VOID App_MQTT_Reconnect_Thread_Entry(ULONG thread_input);
 
 static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_TIME *local_time);
 static ULONG nx_secure_tls_session_time_function(void);
@@ -310,6 +312,20 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr)
 	/* create the device status report thread */
 	  ret = tx_thread_create(&AppDeviceReportThread, "App Device Report Thread", App_Device_Report_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
 							 MQTT_PRIORITY + 2, MQTT_PRIORITY + 2, TX_NO_TIME_SLICE, TX_DONT_START);
+
+	  if (ret != TX_SUCCESS)
+	  {
+		return NX_NOT_ENABLED;
+	  }
+
+	  /* Allocate the memory for MQTT reconnect thread   */
+	  	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
+	  	{
+	  	  return TX_POOL_ERROR;
+	  	}
+	  	/* create MQTT reconnect thread */
+	  ret = tx_thread_create(&AppMqttReconnectThread, "App MQTT Reconnect Thread", App_MQTT_Reconnect_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
+			                 12, 12, TX_NO_TIME_SLICE, TX_DONT_START);
 
 	  if (ret != TX_SUCCESS)
 	  {
@@ -724,7 +740,8 @@ static void send_device_report(void)
 	}
 }
 
-// MQTT client observation:
+// Todo: MQTT client is not able to reconnect to broker. Need to understand root cause.
+// MQTT client observation when disconnect ETH cable:
 //    - MQTT client status is CONNECTED even cable disconnected for a while.
 //      It changes status to DISCONNECTED after timeout period if cable still disconnected.
 //      If MQTT client status is CONNECTED when cable disconnected, nxd_mqtt_client_subscribe()
@@ -733,22 +750,45 @@ static void send_device_report(void)
 //    - There is the case reconnecting to broker is unsuccessfully.
 //      + Publish some messages when MQTT client status is CONNECTED and cable disconnected.
 //      + MQTT client change status to DISCONNECTED and disconnect callback function called,
-//        reconnect to broker is unsuccessfully.
+//        reconnect to broker is unsuccessfully. Publishing data rate and application thread
+//        priority affect very much to MQTT client behavior. If the rate is greater than 0.5
+//        messages per second (publish 1 message every 2 seconds), and application thread is
+//        higher than other threads, we can observe corrupt behavior of MQTT client more frequently,
+//        it is not able to reconnect to broker.
 //        --> Need to study MQTT client source code and identify the root cause.
 //            Maybe MQTT client state is corrupt if sending messages when cable disconnected.
+//        --> Review how to set thread priority properly: IP thread, MQTT thread, Application thread.
 //    --> MQTT client state can be corrupt, consider solution to detect communication error with broker
 //        and restart SW using watchdog timer.
 
-static UINT connect_to_broker(ULONG server_addr)
+static UINT connect_to_broker()
 {
 	CHAR allDeviceTopic[128];
 	NXD_ADDRESS mqtt_server_ip;
+	ULONG broker_addr;
 	UINT ret = NX_SUCCESS;
 
+#ifdef MOSQUITTO_MQTT_PUBLIC
+  do
+  {
+	  /* Look up MQTT Server address until success. */
+	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)MQTT_BROKER_NAME,
+	                                &broker_addr, DEFAULT_TIMEOUT);
+	  if (ret != NX_SUCCESS)
+	  {
+		  tx_thread_sleep(DEFAULT_TIMEOUT);
+	  }
+  }
+  while (ret != NX_SUCCESS);
+#else
+	  broker_addr = LOCAL_SERVER_ADDRESS;
+#endif
 	mqtt_server_ip.nxd_ip_version = 4;
-	mqtt_server_ip.nxd_ip_address.v4 = server_addr;
-	printf("Connecting to broker\n");
+	mqtt_server_ip.nxd_ip_address.v4 = broker_addr;
+	nxd_mqtt_client_login_set(&MqttClient, DEVICE_ID, strlen(DEVICE_ID),
+			                  DEVICE_TOKEN, strlen(DEVICE_TOKEN));
 
+	printf("Connecting to broker\n");
 	/* Start a secure connection to the server. */
 	ret = nxd_mqtt_client_secure_connect(&MqttClient, &mqtt_server_ip,
 			MQTT_PORT, tls_setup_callback,
@@ -861,28 +901,11 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
   UINT topic_length, message_length;
   UINT remaining_msg = NB_MESSAGE;
   UINT unlimited_publish = NX_FALSE;
-  ULONG broker_addr;
   UINT message_count = 0;
   CHAR cmp_topic[128];
 
   /* Initialize and pass statically allocated tokens */
   lwjson_init(&lwjson, tokens, LWJSON_ARRAYSIZE(tokens));
-
-#ifdef MOSQUITTO_MQTT_PUBLIC
-  do
-  {
-	  /* Look up MQTT Server address until success. */
-	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)MQTT_BROKER_NAME,
-	                                &broker_addr, DEFAULT_TIMEOUT);
-	  if (ret != NX_SUCCESS)
-	  {
-		  tx_thread_sleep(DEFAULT_TIMEOUT);
-	  }
-  }
-  while (ret != NX_SUCCESS);
-#else
-	  broker_addr = LOCAL_SERVER_ADDRESS;
-#endif
 
   /* Create MQTT client instance. */
   ret = nxd_mqtt_client_create(&MqttClient, "my_client", DEVICE_ID, STRLEN(DEVICE_ID),
@@ -909,9 +932,6 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 		                           (UCHAR*)"offline", strlen("offline"), NX_FALSE, QOS1);
 #endif
 
-  nxd_mqtt_client_login_set(&MqttClient, DEVICE_ID, strlen(DEVICE_ID),
-		                    DEVICE_TOKEN, strlen(DEVICE_TOKEN));
-
   /* Register the disconnect notification function. */
   nxd_mqtt_client_disconnect_notify_set(&MqttClient, my_disconnect_func);
 
@@ -924,9 +944,10 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
   {
     Error_Handler();
   }
-  connect_to_broker(broker_addr);
+  connect_to_broker();
   tx_thread_resume(&AppTelemetryDataThread);
   tx_thread_resume(&AppDeviceReportThread);
+  tx_thread_resume(&AppMqttReconnectThread);
 
   if (NB_MESSAGE ==0)
     unlimited_publish = NX_TRUE;
@@ -1100,6 +1121,20 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 
   /* test OK -> success Handler */
   Success_Handler();
+}
+
+static VOID App_MQTT_Reconnect_Thread_Entry(ULONG thread_input)
+{
+	while (1)
+	{
+		if ((MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&
+			(MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
+		{
+			connect_to_broker();
+			// Check connection every 5s.
+			tx_thread_sleep(500);
+		}
+	}
 }
 
 /**
