@@ -126,7 +126,7 @@ extern   "C" {
    it a higher priority increases the risk of 'starving' out the IP thread task which
    needs to initialize the network driver (which is required to be able to transmit packets). */
 #ifndef NX_DHCP_THREAD_PRIORITY
-#define NX_DHCP_THREAD_PRIORITY         3
+#define NX_DHCP_THREAD_PRIORITY         11
 #endif
 
 

@@ -325,7 +325,7 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr)
 	  	}
 	  	/* create MQTT reconnect thread */
 	  ret = tx_thread_create(&AppMqttReconnectThread, "App MQTT Reconnect Thread", App_MQTT_Reconnect_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
-			                 12, 12, TX_NO_TIME_SLICE, TX_DONT_START);
+			                 19, 19, TX_NO_TIME_SLICE, TX_DONT_START);
 
 	  if (ret != TX_SUCCESS)
 	  {

@@ -57,9 +57,9 @@ extern "C" {
 #define DEFAULT_MEMORY_SIZE         1024
 #define ARP_MEMORY_SIZE             DEFAULT_MEMORY_SIZE
 #define DEFAULT_MAIN_PRIORITY       10
-#define MQTT_PRIORITY               3
-#define SNTP_PRIORITY               5
-#define LINK_PRIORITY               11
+#define MQTT_PRIORITY               15
+#define SNTP_PRIORITY               13
+#define LINK_PRIORITY               18
 #define THREAD_MEMORY_SIZE          4 * DEFAULT_MEMORY_SIZE
 #define APP_QUEUE_SIZE              10
 
@@ -67,7 +67,7 @@ extern "C" {
 /* MQTT Client configuration */
 #define MQTT_CLIENT_STACK_SIZE      1024 * 10
 #define CLIENT_ID_STRING            "MQTT_client_ID"
-#define MQTT_THREAD_PRIORTY         2
+#define MQTT_THREAD_PRIORTY         14
 #define MQTT_KEEP_ALIVE_TIMER       300                /* Define the MQTT keep alive timer for 5 minutes */
 #define CLEAN_SESSION               NX_TRUE
 #define STRLEN(p)                   (sizeof(p) - 1)
@@ -108,7 +108,7 @@ extern "C" {
 #define DEFAULT_TIMEOUT             5 * NX_IP_PERIODIC_RATE
 #define SNTP_CLIENT_REQUEST_TIMEOUT 10  /* 10s */
 
-#define NX_APP_CABLE_CONNECTION_CHECK_PERIOD      (5 * NX_IP_PERIODIC_RATE)
+#define NX_APP_CABLE_CONNECTION_CHECK_PERIOD      (3 * NX_IP_PERIODIC_RATE)
 /* USER CODE END EC */
 /* The DEFAULT_PAYLOAD_SIZE should match with RxBuffLen configured via MX_ETH_Init */
 #ifndef DEFAULT_PAYLOAD_SIZE
