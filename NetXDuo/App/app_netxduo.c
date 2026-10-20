@@ -701,19 +701,30 @@ static void send_device_report(void)
 		}
 
 
+		/* Serialize property object */
+		res = lwjson_serializer_start_object(&serializer, "property", strlen("property"));
+		if (res != lwjsonOK) {
+			printf("Failed to start property: %d\n", res);
+			return;
+		}
 		/* Serialize led status */
 		// Pin high --> led off
 		// Pin low  --> led on
-		res = lwjson_serializer_add_int(&serializer, "green_led", strlen("green_led"),
-										(HAL_GPIO_ReadPin(GPIOC, LED_GREEN_Pin) ? 0 : 1));
+		res = lwjson_serializer_add_bool(&serializer, "green_led", strlen("green_led"),
+										 (HAL_GPIO_ReadPin(GPIOC, LED_GREEN_Pin) ? 0 : 1));
 		if (res != lwjsonOK) {
 			printf("Failed to add green led status: %d\n", res);
 			return;
 		}
-		res = lwjson_serializer_add_int(&serializer, "red_led", strlen("red_led"),
-										(HAL_GPIO_ReadPin(GPIOC, LED_RED_Pin) ? 0 : 1));
+		res = lwjson_serializer_add_bool(&serializer, "red_led", strlen("red_led"),
+										 (HAL_GPIO_ReadPin(GPIOC, LED_RED_Pin) ? 0 : 1));
 		if (res != lwjsonOK) {
 			printf("Failed to add red led status: %d\n", res);
+			return;
+		}
+		res = lwjson_serializer_end_object(&serializer);
+		if (res != lwjsonOK) {
+			printf("Failed to end property: %d\n", res);
 			return;
 		}
 
