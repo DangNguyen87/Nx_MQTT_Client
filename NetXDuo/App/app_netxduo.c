@@ -44,6 +44,7 @@ TX_THREAD AppSNTPThread;
 TX_THREAD AppLinkThread;
 TX_THREAD AppDeviceReportThread;
 TX_THREAD AppMqttReconnectThread;
+TX_THREAD AppSendingMessageThread;
 TX_QUEUE  MsgQueueOne;
 
 NXD_MQTT_CLIENT MqttClient;
@@ -72,6 +73,7 @@ ULONG current_time;
 
 static lwjson_token_t tokens[128];
 static lwjson_t lwjson;
+TX_BLOCK_POOL send_message_block_pool;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -90,6 +92,7 @@ NX_PACKET_POOL NxAppPool;
 NX_IP          NetXDuoEthIpInstance;
 TX_SEMAPHORE   DHCPSemaphore;
 NX_DHCP        DHCPClient;
+
 /* USER CODE BEGIN PV */
 /* USER CODE END PV */
 
@@ -103,6 +106,7 @@ static VOID App_Link_Thread_Entry(ULONG thread_input);
 static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input);
 static VOID App_Device_Report_Thread_Entry(ULONG thread_input);
 static VOID App_MQTT_Reconnect_Thread_Entry(ULONG thread_input);
+static VOID App_Send_Message_Thread_Entry(ULONG thread_input);
 
 static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_TIME *local_time);
 static ULONG nx_secure_tls_session_time_function(void);
@@ -318,6 +322,21 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr)
 		return NX_NOT_ENABLED;
 	  }
 
+	  /* Allocate the memory for sending message thread   */
+	  	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
+	  	{
+	  	  return TX_POOL_ERROR;
+	  	}
+	  	/* create sending message thread */
+	  ret = tx_thread_create(&AppSendingMessageThread, "Sending Message Thread", App_Send_Message_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
+							 MQTT_PRIORITY - 1, MQTT_PRIORITY - 1, TX_NO_TIME_SLICE, TX_DONT_START);
+
+	  if (ret != TX_SUCCESS)
+	  {
+		return NX_NOT_ENABLED;
+	  }
+
+
 	  /* Allocate the memory for MQTT reconnect thread   */
 	  	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
 	  	{
@@ -350,16 +369,30 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr)
   }
 
   /* Allocate the MsgQueueOne.  */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, APP_QUEUE_SIZE*sizeof(ULONG), TX_NO_WAIT) != TX_SUCCESS)
+  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, MQTT_SEND_MESSAGE_QUEUE_SIZE *sizeof(ULONG), TX_NO_WAIT) != TX_SUCCESS)
   {
     ret = TX_POOL_ERROR;
   }
 
   /* Create the MsgQueueOne shared by MsgSenderThreadOne and MsgReceiverThread */
-  if (tx_queue_create(&MsgQueueOne, "Message Queue One",TX_1_ULONG, pointer, APP_QUEUE_SIZE*sizeof(ULONG)) != TX_SUCCESS)
+  if (tx_queue_create(&MsgQueueOne, "Message Queue One",TX_1_ULONG, pointer, MQTT_SEND_MESSAGE_QUEUE_SIZE*sizeof(ULONG)) != TX_SUCCESS)
   {
     ret = TX_QUEUE_ERROR;
   }
+
+
+  /* Allocate memory for block pool.  */
+	if (tx_byte_allocate(byte_pool, (VOID **) &pointer,
+			             MQTT_SEND_MESSAGE_QUEUE_SIZE * 2 *sizeof(MQTT_SEND_MESSAGE),
+						 TX_NO_WAIT) != TX_SUCCESS)
+	{
+	  ret = TX_POOL_ERROR;
+	}
+  // Create a block pool to allocate message structures safely
+	tx_block_pool_create(&send_message_block_pool, "MQTT Sending Message Block Pool",
+			             sizeof(MQTT_SEND_MESSAGE), pointer,
+						 MQTT_SEND_MESSAGE_QUEUE_SIZE * 2 * sizeof(MQTT_SEND_MESSAGE));
+
 
   /* USER CODE END MX_NetXDuo_Init */
 
@@ -668,7 +701,7 @@ static VOID App_SNTP_Thread_Entry(ULONG thread_input)
   while (ret != NX_SUCCESS);
 
   /* start the MQTT client thread */
-  tx_thread_resume(&AppMQTTClientThread);
+  tx_thread_resume(&AppMqttReconnectThread);
 
 }
 
@@ -825,78 +858,138 @@ static UINT connect_to_broker()
 	return NX_SUCCESS;
 }
 
+static void add_report_request_to_queue(void)
+{
+	MQTT_SEND_MESSAGE *msg_ptr;
+
+	// Allocate a block from the pool
+	if (tx_block_allocate(&send_message_block_pool, (VOID **)&msg_ptr, TX_NO_WAIT) == TX_SUCCESS)
+	{
+		msg_ptr->message_type = MSG_TYPE_SEND_REPORT_MESSAGE;
+
+		// Send the pointer through the queue
+		tx_queue_send(&MsgQueueOne, &msg_ptr, TX_WAIT_FOREVER);
+	}
+}
+
 static VOID App_Device_Report_Thread_Entry(ULONG thread_input)
 {
 	while (1)
 	{
-		send_device_report();
+		add_report_request_to_queue();
 		// Send report every 60s
 		tx_thread_sleep(6000);
 	}
 }
 
-static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input)
+static void send_telemetry_data(MQTT_SEND_MESSAGE *msg_ptr)
 {
 	lwjson_serializer_t serializer;
 	size_t outputBytes = 0;
-	UINT aRandom32bit;
 	CHAR telemetry_topic[NXD_MQTT_MAX_TOPIC_NAME_LENGTH];
 	CHAR serialized_json[NXD_MQTT_MAX_MESSAGE_LENGTH];
 	lwjsonr_t res;
 
+	if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
+	{
+		snprintf(telemetry_topic, NXD_MQTT_MAX_TOPIC_NAME_LENGTH,
+							 "d2c/%s/data", DEVICE_ID);
+
+		/* Initialize serializer with output buffer */
+		res = lwjson_serializer_init(&serializer, serialized_json,
+									 NXD_MQTT_MAX_MESSAGE_LENGTH);
+		if (res != lwjsonOK) {
+			printf("Failed to initialize serializer: %d\r\n", res);
+			return;
+		}
+
+		/* Start root object */
+		res = lwjson_serializer_start_object(&serializer, NULL, 0);
+		if (res != lwjsonOK) {
+			printf("Failed to start object: %d\r\n", res);
+			return;
+		}
+
+		res = lwjson_serializer_add_uint(&serializer, "Temperature", strlen("Temperature"),
+				                         msg_ptr->payload.temperature);
+		if (res != lwjsonOK) {
+			printf("Failed to add Temperature data: %d\n", res);
+			return;
+		}
+
+		/* End root object */
+		res = lwjson_serializer_end_object(&serializer);
+		if (res != lwjsonOK) {
+			printf("Failed to end object: %d\n", res);
+			return;
+		}
+
+		res = lwjson_serializer_finalize(&serializer, &outputBytes);
+		if (res != lwjsonOK) {
+			printf("Failed to finalize serializer: %d\n", res);
+			return;
+		}
+		/* Ensure null termination */
+		serialized_json[outputBytes] = '\0';
+		printf("Serialize data string: %s\n", serialized_json);
+
+		nxd_mqtt_client_publish(&MqttClient, telemetry_topic,
+								strlen(telemetry_topic),
+								(CHAR*)serialized_json, outputBytes,
+								NX_FALSE, QOS1, NX_WAIT_FOREVER);
+	}
+}
+
+static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input)
+{
+	MQTT_SEND_MESSAGE *msg_ptr;
+	UINT aRandom32bit;
+
 	while (1)
 	{
-		if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
+		aRandom32bit = message_generate();
+		printf("Random 32 bit: %u\n", aRandom32bit);
+
+		// Allocate a block from the pool
+		if (tx_block_allocate(&send_message_block_pool, (VOID **)&msg_ptr, TX_NO_WAIT) == TX_SUCCESS)
 		{
-			snprintf(telemetry_topic, NXD_MQTT_MAX_TOPIC_NAME_LENGTH,
-					 "d2c/%s/data", DEVICE_ID);
-			aRandom32bit = message_generate();
+			msg_ptr->message_type = MSG_TYPE_SEND_TELEMETRY_DATA;
+			msg_ptr->payload.temperature = aRandom32bit;
 
-			/* Initialize serializer with output buffer */
-			res = lwjson_serializer_init(&serializer, serialized_json,
-					                     NXD_MQTT_MAX_MESSAGE_LENGTH);
-			if (res != lwjsonOK) {
-				printf("Failed to initialize serializer: %d\r\n", res);
-				return;
-			}
-
-			/* Start root object */
-			res = lwjson_serializer_start_object(&serializer, NULL, 0);
-			if (res != lwjsonOK) {
-				printf("Failed to start object: %d\r\n", res);
-				return;
-			}
-
-			res = lwjson_serializer_add_uint(&serializer, "Temperature", strlen("Temperature"),
-					                         aRandom32bit);
-			if (res != lwjsonOK) {
-				printf("Failed to add Temperature data: %d\n", res);
-				return;
-			}
-
-			/* End root object */
-			res = lwjson_serializer_end_object(&serializer);
-			if (res != lwjsonOK) {
-				printf("Failed to end object: %d\n", res);
-				return;
-			}
-
-			res = lwjson_serializer_finalize(&serializer, &outputBytes);
-			if (res != lwjsonOK) {
-				printf("Failed to finalize serializer: %d\n", res);
-				return;
-			}
-			/* Ensure null termination */
-			serialized_json[outputBytes] = '\0';
-			printf("Serialize data string: %s\n", serialized_json);
-
-			nxd_mqtt_client_publish(&MqttClient, telemetry_topic,
-									strlen(telemetry_topic),
-								    (CHAR*)serialized_json, outputBytes,
-									NX_FALSE, QOS1, NX_WAIT_FOREVER);
+			// Send the pointer through the queue
+			tx_queue_send(&MsgQueueOne, &msg_ptr, TX_WAIT_FOREVER);
 		}
 		// Send data every 10s.
 		tx_thread_sleep(1000);
+	}
+}
+
+static VOID App_Send_Message_Thread_Entry(ULONG thread_input)
+{
+	MQTT_SEND_MESSAGE *received_msg_ptr;
+
+	while (1)
+	{
+		// Wait for a pointer message to arrive
+		if (tx_queue_receive(&MsgQueueOne, &received_msg_ptr, TX_WAIT_FOREVER) == TX_SUCCESS)
+		{
+			// Handle based on message type
+			switch (received_msg_ptr->message_type)
+			{
+				case MSG_TYPE_SEND_REPORT_MESSAGE:
+					send_device_report();
+					break;
+
+				case MSG_TYPE_SEND_TELEMETRY_DATA:
+					send_telemetry_data(received_msg_ptr);
+					break;
+				default:
+					break;
+			}
+
+			// CRITICAL: Always release the block back to the pool after processing
+			tx_block_release(received_msg_ptr);
+		}
 	}
 }
 
@@ -915,50 +1008,7 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
   UINT message_count = 0;
   CHAR cmp_topic[128];
 
-  /* Initialize and pass statically allocated tokens */
-  lwjson_init(&lwjson, tokens, LWJSON_ARRAYSIZE(tokens));
 
-  /* Create MQTT client instance. */
-  ret = nxd_mqtt_client_create(&MqttClient, "my_client", DEVICE_ID, STRLEN(DEVICE_ID),
-                               &NetXDuoEthIpInstance, &NxAppPool, (VOID*)mqtt_client_stack, MQTT_CLIENT_STACK_SIZE,
-                               MQTT_THREAD_PRIORTY, NX_NULL, 0);
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-#if 0
-  /**
-   * Should use periodic report message for device online/offline detection.
-   *
-   * Observed will message behavior with Mosquitto broker:
-   * - Will message will be published after (1.5 x keep alive) period (set when connect to broker).
-   * - If device reconnect (resends CONNECT message) to broker within (1.5 x keep alive) period,
-   *   user receive unexpected will message.
-   * - If device reconnect (resends CONNECT message) to broker after (1.5 x keep alive) period,
-   *   broker will not publish will message.
-   */
-  snprintf(cmp_topic, STRLEN(cmp_topic), "d2c/%s/status", DEVICE_ID);
-  nxd_mqtt_client_will_message_set(&MqttClient, (UCHAR*)cmp_topic, strlen(cmp_topic),
-		                           (UCHAR*)"offline", strlen("offline"), NX_FALSE, QOS1);
-#endif
-
-  /* Register the disconnect notification function. */
-  nxd_mqtt_client_disconnect_notify_set(&MqttClient, my_disconnect_func);
-
-  /* Set the receive notify function. */
-  nxd_mqtt_client_receive_notify_set(&MqttClient, my_notify_func);
-
-  /* Create an MQTT flag */
-  ret = tx_event_flags_create(&mqtt_app_flag, "my app event");
-  if (ret != TX_SUCCESS)
-  {
-    Error_Handler();
-  }
-  connect_to_broker();
-  tx_thread_resume(&AppTelemetryDataThread);
-  tx_thread_resume(&AppDeviceReportThread);
-  tx_thread_resume(&AppMqttReconnectThread);
 
   if (NB_MESSAGE ==0)
     unlimited_publish = NX_TRUE;
@@ -1010,11 +1060,15 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 									  (tk_led_type->u.str.token_value_len == strlen("green")))
 								  {
 									  HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_RESET);
+									  // Change led state, send report to update all clients.
+									  add_report_request_to_queue();
 								  }
 								  else if ((strncmp(tk_led_type->u.str.token_value, "red", tk_led_type->u.str.token_value_len) == 0) &&
 										   (tk_led_type->u.str.token_value_len == strlen("red")))
 								  {
 									  HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_RESET);
+									  // Change led state, send report to update all clients.
+									  add_report_request_to_queue();
 								  }
 								  else
 								  {
@@ -1029,11 +1083,15 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 								  (tk_led_type->u.str.token_value_len == strlen("green")))
 							  {
 								  HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_SET);
+								  // Change led state, send report to update all clients.
+								  add_report_request_to_queue();
 							  }
 							  else if ((strncmp(tk_led_type->u.str.token_value, "red", tk_led_type->u.str.token_value_len) == 0) &&
 									   (tk_led_type->u.str.token_value_len == strlen("red")))
 							  {
 								  HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_SET);
+								  // Change led state, send report to update all clients.
+								  add_report_request_to_queue();
 							  }
 							  else
 							  {
@@ -1076,7 +1134,8 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 								  (strncmp(tk_topic_element->u.str.token_value, "property", tk_topic_element->u.str.token_value_len) == 0) &&
 								  (strlen("property") == tk_topic_element->u.str.token_value_len))
 							  {
-								  send_device_report();
+								  // Add the request to send the report by other thread.
+								  add_report_request_to_queue();
 							  }
 						  }
 					  }
@@ -1136,6 +1195,54 @@ static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
 
 static VOID App_MQTT_Reconnect_Thread_Entry(ULONG thread_input)
 {
+	UINT ret = NX_SUCCESS;
+
+	/* Initialize and pass statically allocated tokens */
+	  lwjson_init(&lwjson, tokens, LWJSON_ARRAYSIZE(tokens));
+
+	  /* Create MQTT client instance. */
+	  ret = nxd_mqtt_client_create(&MqttClient, "my_client", DEVICE_ID, STRLEN(DEVICE_ID),
+	                               &NetXDuoEthIpInstance, &NxAppPool, (VOID*)mqtt_client_stack, MQTT_CLIENT_STACK_SIZE,
+	                               MQTT_THREAD_PRIORTY, NX_NULL, 0);
+	  if (ret != NX_SUCCESS)
+	  {
+	    Error_Handler();
+	  }
+
+	#if 0
+	  /**
+	   * Should use periodic report message for device online/offline detection.
+	   *
+	   * Observed will message behavior with Mosquitto broker:
+	   * - Will message will be published after (1.5 x keep alive) period (set when connect to broker).
+	   * - If device reconnect (resends CONNECT message) to broker within (1.5 x keep alive) period,
+	   *   user receive unexpected will message.
+	   * - If device reconnect (resends CONNECT message) to broker after (1.5 x keep alive) period,
+	   *   broker will not publish will message.
+	   */
+	  snprintf(cmp_topic, STRLEN(cmp_topic), "d2c/%s/status", DEVICE_ID);
+	  nxd_mqtt_client_will_message_set(&MqttClient, (UCHAR*)cmp_topic, strlen(cmp_topic),
+			                           (UCHAR*)"offline", strlen("offline"), NX_FALSE, QOS1);
+	#endif
+
+	  /* Register the disconnect notification function. */
+	  nxd_mqtt_client_disconnect_notify_set(&MqttClient, my_disconnect_func);
+
+	  /* Set the receive notify function. */
+	  nxd_mqtt_client_receive_notify_set(&MqttClient, my_notify_func);
+
+	  /* Create an MQTT flag */
+	  ret = tx_event_flags_create(&mqtt_app_flag, "my app event");
+	  if (ret != TX_SUCCESS)
+	  {
+	    Error_Handler();
+	  }
+	  connect_to_broker();
+	  tx_thread_resume(&AppTelemetryDataThread);
+	  tx_thread_resume(&AppDeviceReportThread);
+	  tx_thread_resume(&AppMQTTClientThread);
+	  tx_thread_resume(&AppSendingMessageThread);
+
 	while (1)
 	{
 		if ((MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&

@@ -168,6 +168,19 @@ UINT MX_NetXDuo_Init(VOID *memory_ptr);
 #define NX_APP_DEFAULT_NET_MASK                     0
 
 /* USER CODE BEGIN 2 */
+// Define message types
+#define MSG_TYPE_SEND_REPORT_MESSAGE      1
+#define MSG_TYPE_SEND_TELEMETRY_DATA      2
+
+// Define a common wrapper structure
+typedef struct {
+    UINT   message_type;
+    union {
+        int temperature;
+    } payload;
+} MQTT_SEND_MESSAGE;
+
+#define MQTT_SEND_MESSAGE_QUEUE_SIZE     10
 
 /* USER CODE END 2 */
 
