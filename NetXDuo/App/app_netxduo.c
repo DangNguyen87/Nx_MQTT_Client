@@ -1,787 +1,747 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file    app_netxduo.c
-  * @author  MCD Application Team
-  * @brief   NetXDuo applicative file
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2021 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-
-/* USER CODE BEGIN 1 */
-
-/* USER CODE END 1 */
-
-/* Includes ------------------------------------------------------------------*/
 #include "app_netxduo.h"
-
-/* Private includes ----------------------------------------------------------*/
-#include "nxd_dhcp_client.h"
-/* USER CODE BEGIN Includes */
-#include "nx_ip.h"
-#include  MOSQUITTO_CERT_FILE
+#include  APP_BROKER_CERT_FILE
 #include "lwjson/lwjson.h"
 #include "lwjson/lwjson_serializer.h"
-/* USER CODE END Includes */
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+/**
+ * Todo:
+ * 1. Review error handling mechanism
+ *     - How to handle error when initialize network stack failed?
+ *     - Mechanism to detect error and restart application?
+ *     - Replace Error_Handler() in main.h.
+ * 2. Evaluate application configuration
+ *     - Heap, stack size
+ *     - Threads' stack size
+ *     - Memory section in linker file, memory section address.
+ *         + NetX memory poll size
+ *         + Ethernet descriptor size
+ *     - Threads' priority
+ */
+#define PRINT_IP_ADDRESS(addr)                        \
+    do                                                \
+    {                                                 \
+        printf("STM32 %s: %lu.%lu.%lu.%lu \n", #addr, \
+               (addr >> 24) & 0xff,                   \
+               (addr >> 16) & 0xff,                   \
+               (addr >> 8) & 0xff,                    \
+               (addr & 0xff));                        \
+    } while (0)
+
+/* Variables use to work with IP instance */
+static NX_IP app_ip_instance;
+static NX_PACKET_POOL app_packet_pool;
+static ULONG app_ip_address;
+static ULONG app_net_mask;
+
+/* Main application thread */
+static TX_THREAD app_main_thread;
+
+/* Variables use for DHCP protocol communication */
+static NX_DHCP app_dhcp_client;
+static TX_SEMAPHORE app_dhcp_semaphore;
+
+/* Variables use for SNTP protocol communication */
+static TX_THREAD app_sntp_thread;
+static NX_SNTP_CLIENT app_sntp_client;
+static ULONG app_sntp_time_from_epoch;
+
+/* DNS client use to get IP address */
+static NX_DNS app_dns_client;
+
+/*
+ * Thread variable use to check link status and
+ * get new IP address if cable reconnected.
+ */
+static TX_THREAD app_link_check_thread;
+
+/* Variables use for MQTT communication */
+static TX_THREAD app_process_received_message_thread;
+static TX_THREAD app_telemetry_data_thread;
+static TX_THREAD app_device_report_thread;
+static TX_THREAD app_mqtt_connection_check_thread;
+static TX_THREAD app_send_message_thread;
+static NXD_MQTT_CLIENT app_mqtt_client;
+static ULONG app_mqtt_client_stack[APP_MQTT_CLIENT_THREAD_STACK_SIZE];
+static TX_EVENT_FLAGS_GROUP app_message_received_flag;
+static TX_QUEUE app_send_message_queue;
+/* Memory pool for allocating messages to put on queue */
+static TX_BLOCK_POOL app_message_block_pool;
 extern RNG_HandleTypeDef hrng;
 
-TX_THREAD AppMQTTClientThread;
-TX_THREAD AppTelemetryDataThread;
-TX_THREAD AppSNTPThread;
-TX_THREAD AppLinkThread;
-TX_THREAD AppDeviceReportThread;
-TX_THREAD AppMqttReconnectThread;
-TX_THREAD AppSendingMessageThread;
-TX_QUEUE  MsgQueueOne;
-
-NXD_MQTT_CLIENT MqttClient;
-NX_SNTP_CLIENT  SntpClient;
-static NX_DNS   DnsClient;
-
-ULONG   IpAddress;
-ULONG   NetMask;
-
-ULONG mqtt_client_stack[MQTT_CLIENT_STACK_SIZE];
-
-TX_EVENT_FLAGS_GROUP mqtt_app_flag;
-
-/* Declare buffers to hold message and topic. */
-static char message[NXD_MQTT_MAX_MESSAGE_LENGTH];
-static UCHAR message_buffer[NXD_MQTT_MAX_MESSAGE_LENGTH];
-static UCHAR topic_buffer[NXD_MQTT_MAX_TOPIC_NAME_LENGTH];
-
+/* Variable use for MQTT TLS communication */
+/* Todo: Review how to use these buffers for TLS communication */
 /* TLS buffers and certificate containers. */
 extern const NX_SECURE_TLS_CRYPTO nx_crypto_tls_ciphers;
-/* calculated with nx_secure_tls_metadata_size_calculate */
-static CHAR crypto_metadata_client[11600];
+/* Calculated with nx_secure_tls_metadata_size_calculate */
+static CHAR app_crypto_metadata_client[11600];
 /* Define the TLS packet reassembly buffer. */
-UCHAR tls_packet_buffer[4000];
-ULONG current_time;
+static UCHAR app_tls_packet_buffer[4000];
 
-static lwjson_token_t tokens[128];
-static lwjson_t lwjson;
-TX_BLOCK_POOL send_message_block_pool;
-/* USER CODE END PTD */
+/* Variables use for LwJson to parse and serialize MQTT messages */
+static lwjson_t app_lwjson;
+static lwjson_token_t app_tokens_buffer[128];
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
+/* List of thread entry function prototype */
+static VOID app_main_thread_entry(ULONG thread_input);
+static VOID app_sntp_thread_entry(ULONG thread_input);
+static VOID app_process_received_message_thread_entry(ULONG thread_input);
+static VOID app_telemetry_data_thread_entry(ULONG thread_input);
+static VOID app_device_report_thread_entry(ULONG thread_input);
+static VOID app_mqtt_connection_check_thread_entry(ULONG thread_input);
+static VOID app_send_message_thread_entry(ULONG thread_input);
+static VOID app_link_check_thread_entry(ULONG thread_input);
 
-/* USER CODE END PD */
+/* List of callback functions */
+static VOID app_ip_address_change_cb(NX_IP *ip_instance, VOID *ptr);
+static VOID app_sntp_time_update_cb(NX_SNTP_TIME_MESSAGE *time_update_ptr,
+                                    NX_SNTP_TIME *local_time);
+static ULONG app_tls_session_time_function(void);
+static UINT app_tls_setup_callback(NXD_MQTT_CLIENT *client_pt,
+                                   NX_SECURE_TLS_SESSION *TLS_session_ptr,
+                                   NX_SECURE_X509_CERT *certificate_ptr,
+                                   NX_SECURE_X509_CERT *trusted_certificate_ptr);
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
+static UINT app_dns_create(NX_DNS *dns_ptr);
+static UINT app_message_generate_stub(void);
 
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-TX_THREAD      NxAppThread;
-NX_PACKET_POOL NxAppPool;
-NX_IP          NetXDuoEthIpInstance;
-TX_SEMAPHORE   DHCPSemaphore;
-NX_DHCP        DHCPClient;
-
-/* USER CODE BEGIN PV */
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-static VOID nx_app_thread_entry (ULONG thread_input);
-static VOID ip_address_change_notify_callback(NX_IP *ip_instance, VOID *ptr);
-/* USER CODE BEGIN PFP */
-static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input);
-static VOID App_SNTP_Thread_Entry(ULONG thread_input);
-static VOID App_Link_Thread_Entry(ULONG thread_input);
-static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input);
-static VOID App_Device_Report_Thread_Entry(ULONG thread_input);
-static VOID App_MQTT_Reconnect_Thread_Entry(ULONG thread_input);
-static VOID App_Send_Message_Thread_Entry(ULONG thread_input);
-
-static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_TIME *local_time);
-static ULONG nx_secure_tls_session_time_function(void);
-static UINT dns_create(NX_DNS *dns_ptr);
-
-static UINT message_generate(void);
-static UINT tls_setup_callback(NXD_MQTT_CLIENT *client_pt,
-                        NX_SECURE_TLS_SESSION *TLS_session_ptr,
-                        NX_SECURE_X509_CERT *certificate_ptr,
-                        NX_SECURE_X509_CERT *trusted_certificate_ptr);
-
-/* USER CODE END PFP */
-
-/**
-  * @brief  Application NetXDuo Initialization.
-  * @param memory_ptr: memory pointer
-  * @retval int
-  */
 UINT MX_NetXDuo_Init(VOID *memory_ptr)
 {
-  UINT ret = NX_SUCCESS;
-  TX_BYTE_POOL *byte_pool = (TX_BYTE_POOL*)memory_ptr;
-  CHAR *pointer;
+    UINT ret = NX_SUCCESS;
+    TX_BYTE_POOL *byte_pool = (TX_BYTE_POOL *)memory_ptr;
+    CHAR *pointer;
 
-  /* USER CODE BEGIN MX_NetXDuo_MEM_POOL */
-  /* USER CODE END MX_NetXDuo_MEM_POOL */
-
-  /* USER CODE BEGIN 0 */
-
-  /* USER CODE END 0 */
-
-  /* Initialize the NetXDuo system. */
-  nx_system_initialize();
+    /* Initialize the NetXDuo system. */
+    nx_system_initialize();
 
     /* Allocate the memory for packet_pool.  */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, NX_APP_PACKET_POOL_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
-
-  /* Create the Packet pool to be used for packet allocation,
-   * If extra NX_PACKET are to be used the NX_APP_PACKET_POOL_SIZE should be increased
-   */
-  ret = nx_packet_pool_create(&NxAppPool, "NetXDuo App Pool", DEFAULT_PAYLOAD_SIZE, pointer, NX_APP_PACKET_POOL_SIZE);
-
-  if (ret != NX_SUCCESS)
-  {
-    return NX_POOL_ERROR;
-  }
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_PACKET_POOL_SIZE, TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /**
+     * Create the Packet pool to be used for packet allocation,
+     * If extra NX_PACKET are to be used the APP_PACKET_POOL_SIZE should be increased.
+     */
+    ret = nx_packet_pool_create(&app_packet_pool, "NetXDuo App Pool",
+                                APP_DEFAULT_PAYLOAD_SIZE, pointer,
+                                APP_PACKET_POOL_SIZE);
+    if (ret != NX_SUCCESS)
+    {
+        return NX_POOL_ERROR;
+    }
 
     /* Allocate the memory for Ip_Instance */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, Nx_IP_INSTANCE_THREAD_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
-
-   /* Create the main NX_IP instance */
-  ret = nx_ip_create(&NetXDuoEthIpInstance, "NetX Ip instance", NX_APP_DEFAULT_IP_ADDRESS, NX_APP_DEFAULT_NET_MASK, &NxAppPool, nx_stm32_eth_driver,
-                     pointer, Nx_IP_INSTANCE_THREAD_SIZE, NX_APP_INSTANCE_PRIORITY);
-
-  if (ret != NX_SUCCESS)
-  {
-    return NX_NOT_SUCCESSFUL;
-  }
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_IP_INSTANCE_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create the main NX_IP instance */
+    ret = nx_ip_create(&app_ip_instance, "NetX Ip instance",
+                       APP_DEFAULT_IP_ADDRESS, APP_DEFAULT_NET_MASK,
+                       &app_packet_pool, nx_stm32_eth_driver, pointer,
+                       APP_IP_INSTANCE_THREAD_STACK_SIZE,
+                       APP_IP_INSTANCE_PRIORITY);
+    if (ret != NX_SUCCESS)
+    {
+        return NX_NOT_SUCCESSFUL;
+    }
 
     /* Allocate the memory for ARP */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, DEFAULT_ARP_CACHE_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_ARP_CACHE_SIZE, TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Enable the ARP protocol and provide the ARP cache size for the IP instance */
+    ret = nx_arp_enable(&app_ip_instance, (VOID *)pointer, APP_ARP_CACHE_SIZE);
+    if (ret != NX_SUCCESS)
+    {
+        return NX_NOT_SUCCESSFUL;
+    }
 
-  /* Enable the ARP protocol and provide the ARP cache size for the IP instance */
+    /* Enable the ICMP */
+    ret = nx_icmp_enable(&app_ip_instance);
+    if (ret != NX_SUCCESS)
+    {
+        return NX_NOT_SUCCESSFUL;
+    }
 
-  /* USER CODE BEGIN ARP_Protocol_Initialization */
+    /* Enable TCP Protocol */
+    ret = nx_tcp_enable(&app_ip_instance);
+    if (ret != NX_SUCCESS)
+    {
+        return NX_NOT_SUCCESSFUL;
+    }
 
-  /* USER CODE END ARP_Protocol_Initialization */
+    /* Enable the UDP protocol required for  DHCP communication */
+    ret = nx_udp_enable(&app_ip_instance);
+    if (ret != NX_SUCCESS)
+    {
+        return NX_NOT_SUCCESSFUL;
+    }
 
-  ret = nx_arp_enable(&NetXDuoEthIpInstance, (VOID *)pointer, DEFAULT_ARP_CACHE_SIZE);
+    /* Allocate the memory for main thread   */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_MAIN_THREAD_STACK_SIZE, TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create NetxDuo main thread */
+    ret = tx_thread_create(&app_main_thread, "NetXDuo main thread",
+                           app_main_thread_entry, 0, pointer,
+                           APP_MAIN_THREAD_STACK_SIZE,
+                           APP_MAIN_THREAD_PRIORITY,
+                           APP_MAIN_THREAD_PRIORITY,
+                           TX_NO_TIME_SLICE,
+                           TX_AUTO_START);
+    if (ret != TX_SUCCESS)
+    {
+        return TX_THREAD_ERROR;
+    }
 
-  if (ret != NX_SUCCESS)
-  {
-    return NX_NOT_SUCCESSFUL;
-  }
+    /* Create the DHCP client */
+    ret = nx_dhcp_create(&app_dhcp_client, &app_ip_instance, "DHCP client");
+    if (ret != NX_SUCCESS)
+    {
+        return NX_DHCP_ERROR;
+    }
 
-  /* Enable the ICMP */
+    /* Create semaphore for DHCP notification callback  */
+    tx_semaphore_create(&app_dhcp_semaphore, "DHCP semaphore", 0);
 
-  /* USER CODE BEGIN ICMP_Protocol_Initialization */
+    printf("Nx_MQTT_Client application started..\n");
 
-  /* USER CODE END ICMP_Protocol_Initialization */
+    /* Allocate the memory for SNTP client thread   */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_SNTP_APPLICATION_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* create the SNTP client thread */
+    ret = tx_thread_create(&app_sntp_thread, "SNTP application thread",
+                           app_sntp_thread_entry, 0, pointer,
+                           APP_SNTP_APPLICATION_THREAD_STACK_SIZE,
+                           APP_SNTP_APPLICATION_PRIORITY,
+                           APP_SNTP_APPLICATION_PRIORITY,
+                           TX_NO_TIME_SLICE, TX_DONT_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  ret = nx_icmp_enable(&NetXDuoEthIpInstance);
+    /* Allocate the memory for MQTT message received thread */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_RECEIVED_MESSAGE_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create the MQTT message received thread */
+    ret = tx_thread_create(&app_process_received_message_thread,
+                           "MQTT message received thread",
+                           app_process_received_message_thread_entry,
+                           0, pointer, APP_RECEIVED_MESSAGE_THREAD_STACK_SIZE,
+                           APP_MQTT_RECEIVED_MESSAGE_PRIORITY,
+                           APP_MQTT_RECEIVED_MESSAGE_PRIORITY,
+                           TX_NO_TIME_SLICE, TX_DONT_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  if (ret != NX_SUCCESS)
-  {
-    return NX_NOT_SUCCESSFUL;
-  }
+    /* Allocate the memory for MQTT telemetry data thread   */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_TELEMETRY_DATA_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create MQTT telemetry data thread */
+    ret = tx_thread_create(&app_telemetry_data_thread, "Telemetry data thread",
+                           app_telemetry_data_thread_entry, 0, pointer,
+                           APP_TELEMETRY_DATA_THREAD_STACK_SIZE,
+                           APP_TELEMETRY_DATA_PRIORITY,
+                           APP_TELEMETRY_DATA_PRIORITY,
+                           TX_NO_TIME_SLICE,
+                           TX_DONT_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  /* Enable TCP Protocol */
+    /* Allocate the memory for device status report thread   */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_DEVICE_REPORT_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create the device status report thread */
+    ret = tx_thread_create(&app_device_report_thread,
+                           "Device status report thread",
+                           app_device_report_thread_entry,
+                           0, pointer,
+                           APP_DEVICE_REPORT_THREAD_STACK_SIZE,
+                           APP_DEVICE_REPORT_PRIORITY,
+                           APP_DEVICE_REPORT_PRIORITY,
+                           TX_NO_TIME_SLICE,
+                           TX_DONT_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  /* USER CODE BEGIN TCP_Protocol_Initialization */
+    /* Allocate the memory for sending message thread */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_SEND_MESSAGE_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create sending message thread */
+    ret = tx_thread_create(&app_send_message_thread,
+                           "Sending message thread",
+                           app_send_message_thread_entry,
+                           0, pointer,
+                           APP_SEND_MESSAGE_THREAD_STACK_SIZE,
+                           APP_MQTT_SEND_MESSAGE_PRIORITY,
+                           APP_MQTT_SEND_MESSAGE_PRIORITY,
+                           TX_NO_TIME_SLICE,
+                           TX_DONT_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  /* USER CODE END TCP_Protocol_Initialization */
+    /* Allocate the memory for MQTT connection check thread   */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_MQTT_CONNECTION_CHECK_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create MQTT connection check thread */
+    ret = tx_thread_create(&app_mqtt_connection_check_thread,
+                           "MQTT connection check thread",
+                           app_mqtt_connection_check_thread_entry,
+                           0, pointer,
+                           APP_MQTT_CONNECTION_CHECK_THREAD_STACK_SIZE,
+                           APP_MQTT_CONNECTION_CHECK_PRIORITY,
+                           APP_MQTT_CONNECTION_CHECK_PRIORITY,
+                           TX_NO_TIME_SLICE, TX_DONT_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  ret = nx_tcp_enable(&NetXDuoEthIpInstance);
+    /* Allocate the memory for link check thread   */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_LINK_CHECK_THREAD_STACK_SIZE,
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        return TX_POOL_ERROR;
+    }
+    /* Create the link check thread */
+    ret = tx_thread_create(&app_link_check_thread, "Link check thread",
+                           app_link_check_thread_entry, 0, pointer,
+                           APP_LINK_CHECK_THREAD_STACK_SIZE,
+                           APP_LINK_CHECK_PRIORITY,
+                           APP_LINK_CHECK_PRIORITY,
+                           TX_NO_TIME_SLICE,
+                           TX_AUTO_START);
+    if (ret != TX_SUCCESS)
+    {
+        return NX_NOT_ENABLED;
+    }
 
-  if (ret != NX_SUCCESS)
-  {
-    return NX_NOT_SUCCESSFUL;
-  }
+    /* Allocate the memory for message queue */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_SENDING_MESSAGE_QUEUE_SIZE * sizeof(ULONG),
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        ret = TX_POOL_ERROR;
+    }
+    /* Create the message queue for sending MQTT message */
+    if (tx_queue_create(&app_send_message_queue,
+                        "MQTT sending message queue",
+                        TX_1_ULONG, pointer,
+                        APP_SENDING_MESSAGE_QUEUE_SIZE * sizeof(ULONG)) != TX_SUCCESS)
+    {
+        ret = TX_QUEUE_ERROR;
+    }
 
-  /* Enable the UDP protocol required for  DHCP communication */
+    /**
+     * Allocate memory for block pool use to allocate sending message information.
+     * Block memory size is rounded up for alignment. Need to allocate more memory
+     * than (number of message * each message size).
+     */
+    if (tx_byte_allocate(byte_pool, (VOID **)&pointer,
+                         APP_SENDING_MESSAGE_QUEUE_SIZE * 2 * sizeof(APP_SENDING_MESSAGE_INFO),
+                         TX_NO_WAIT) != TX_SUCCESS)
+    {
+        ret = TX_POOL_ERROR;
+    }
+    /* Create block pool use to allocate sending message information */
+    tx_block_pool_create(&app_message_block_pool,
+                         "MQTT Sending Message Block Pool",
+                         sizeof(APP_SENDING_MESSAGE_INFO), pointer,
+                         APP_SENDING_MESSAGE_QUEUE_SIZE * 2 * sizeof(APP_SENDING_MESSAGE_INFO));
 
-  /* USER CODE BEGIN UDP_Protocol_Initialization */
-
-  /* USER CODE END UDP_Protocol_Initialization */
-
-  ret = nx_udp_enable(&NetXDuoEthIpInstance);
-
-  if (ret != NX_SUCCESS)
-  {
-    return NX_NOT_SUCCESSFUL;
-  }
-
-   /* Allocate the memory for main thread   */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, NX_APP_THREAD_STACK_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
-
-  /* Create the main thread */
-  ret = tx_thread_create(&NxAppThread, "NetXDuo App thread", nx_app_thread_entry , 0, pointer, NX_APP_THREAD_STACK_SIZE,
-                         NX_APP_THREAD_PRIORITY, NX_APP_THREAD_PRIORITY, TX_NO_TIME_SLICE, TX_AUTO_START);
-
-  if (ret != TX_SUCCESS)
-  {
-    return TX_THREAD_ERROR;
-  }
-
-  /* Create the DHCP client */
-
-  /* USER CODE BEGIN DHCP_Protocol_Initialization */
-
-  /* USER CODE END DHCP_Protocol_Initialization */
-
-  ret = nx_dhcp_create(&DHCPClient, &NetXDuoEthIpInstance, "DHCP Client");
-
-  if (ret != NX_SUCCESS)
-  {
-    return NX_DHCP_ERROR;
-  }
-
-  /* set DHCP notification callback  */
-  tx_semaphore_create(&DHCPSemaphore, "DHCP Semaphore", 0);
-
-  /* USER CODE BEGIN MX_NetXDuo_Init */
-  printf("Nx_MQTT_Client application started..\n");
-
-  /* Allocate the memory for SNTP client thread   */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, SNTP_CLIENT_THREAD_MEMORY, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
-
-  /* create the SNTP client thread */
-  ret = tx_thread_create(&AppSNTPThread, "App SNTP Thread", App_SNTP_Thread_Entry, 0, pointer, SNTP_CLIENT_THREAD_MEMORY,
-                         SNTP_PRIORITY, SNTP_PRIORITY, TX_NO_TIME_SLICE, TX_DONT_START);
-
-  if (ret != TX_SUCCESS)
-  {
-    return NX_NOT_ENABLED;
-  }
-
-  /* Allocate the memory for MQTT client thread   */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
-
-  /* create the MQTT client thread */
-  ret = tx_thread_create(&AppMQTTClientThread, "App MQTT Thread", App_MQTT_Client_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
-                         MQTT_PRIORITY, MQTT_PRIORITY, TX_NO_TIME_SLICE, TX_DONT_START);
-
-  if (ret != TX_SUCCESS)
-  {
-    return NX_NOT_ENABLED;
-  }
-
-  /* Allocate the memory for MQTT telemetry data thread   */
-	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-	{
-	  return TX_POOL_ERROR;
-	}
-	/* create the MQTT client thread */
-	  ret = tx_thread_create(&AppTelemetryDataThread, "App Telemetry Data Thread", App_Telemetry_Data_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
-							 MQTT_PRIORITY + 1, MQTT_PRIORITY + 1, TX_NO_TIME_SLICE, TX_DONT_START);
-
-	  if (ret != TX_SUCCESS)
-	  {
-		return NX_NOT_ENABLED;
-	  }
-
-  /* Allocate the memory for device status report thread   */
-	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-	{
-	  return TX_POOL_ERROR;
-	}
-	/* create the device status report thread */
-	  ret = tx_thread_create(&AppDeviceReportThread, "App Device Report Thread", App_Device_Report_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
-							 MQTT_PRIORITY + 2, MQTT_PRIORITY + 2, TX_NO_TIME_SLICE, TX_DONT_START);
-
-	  if (ret != TX_SUCCESS)
-	  {
-		return NX_NOT_ENABLED;
-	  }
-
-	  /* Allocate the memory for sending message thread   */
-	  	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-	  	{
-	  	  return TX_POOL_ERROR;
-	  	}
-	  	/* create sending message thread */
-	  ret = tx_thread_create(&AppSendingMessageThread, "Sending Message Thread", App_Send_Message_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
-							 MQTT_PRIORITY - 1, MQTT_PRIORITY - 1, TX_NO_TIME_SLICE, TX_DONT_START);
-
-	  if (ret != TX_SUCCESS)
-	  {
-		return NX_NOT_ENABLED;
-	  }
-
-
-	  /* Allocate the memory for MQTT reconnect thread   */
-	  	if (tx_byte_allocate(byte_pool, (VOID **) &pointer, THREAD_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-	  	{
-	  	  return TX_POOL_ERROR;
-	  	}
-	  	/* create MQTT reconnect thread */
-	  ret = tx_thread_create(&AppMqttReconnectThread, "App MQTT Reconnect Thread", App_MQTT_Reconnect_Thread_Entry, 0, pointer, THREAD_MEMORY_SIZE,
-			                 19, 19, TX_NO_TIME_SLICE, TX_DONT_START);
-
-	  if (ret != TX_SUCCESS)
-	  {
-		return NX_NOT_ENABLED;
-	  }
-
-
-
-  /* Allocate the memory for Link thread   */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer,2 *  DEFAULT_MEMORY_SIZE, TX_NO_WAIT) != TX_SUCCESS)
-  {
-    return TX_POOL_ERROR;
-  }
-
-  /* create the Link thread */
-  ret = tx_thread_create(&AppLinkThread, "App Link Thread", App_Link_Thread_Entry, 0, pointer, 2 * DEFAULT_MEMORY_SIZE,
-                         LINK_PRIORITY, LINK_PRIORITY, TX_NO_TIME_SLICE, TX_AUTO_START);
-
-  if (ret != TX_SUCCESS)
-  {
-    return NX_NOT_ENABLED;
-  }
-
-  /* Allocate the MsgQueueOne.  */
-  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, MQTT_SEND_MESSAGE_QUEUE_SIZE *sizeof(ULONG), TX_NO_WAIT) != TX_SUCCESS)
-  {
-    ret = TX_POOL_ERROR;
-  }
-
-  /* Create the MsgQueueOne shared by MsgSenderThreadOne and MsgReceiverThread */
-  if (tx_queue_create(&MsgQueueOne, "Message Queue One",TX_1_ULONG, pointer, MQTT_SEND_MESSAGE_QUEUE_SIZE*sizeof(ULONG)) != TX_SUCCESS)
-  {
-    ret = TX_QUEUE_ERROR;
-  }
-
-
-  /* Allocate memory for block pool.  */
-	if (tx_byte_allocate(byte_pool, (VOID **) &pointer,
-			             MQTT_SEND_MESSAGE_QUEUE_SIZE * 2 *sizeof(MQTT_SEND_MESSAGE),
-						 TX_NO_WAIT) != TX_SUCCESS)
-	{
-	  ret = TX_POOL_ERROR;
-	}
-  // Create a block pool to allocate message structures safely
-	tx_block_pool_create(&send_message_block_pool, "MQTT Sending Message Block Pool",
-			             sizeof(MQTT_SEND_MESSAGE), pointer,
-						 MQTT_SEND_MESSAGE_QUEUE_SIZE * 2 * sizeof(MQTT_SEND_MESSAGE));
-
-
-  /* USER CODE END MX_NetXDuo_Init */
-
-  return ret;
+    return ret;
 }
 
-/**
-* @brief  ip address change callback.
-* @param ip_instance: NX_IP instance
-* @param ptr: user data
-* @retval none
-*/
-static VOID ip_address_change_notify_callback(NX_IP *ip_instance, VOID *ptr)
+static VOID app_ip_address_change_cb(NX_IP *ip_instance, VOID *ptr)
 {
-  /* USER CODE BEGIN ip_address_change_notify_callback */
-  /* release the semaphore as soon as an IP address is available */
-  if (nx_ip_address_get(&NetXDuoEthIpInstance, &IpAddress, &NetMask) != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-  if(IpAddress != NULL_ADDRESS)
-  {
-    tx_semaphore_put(&DHCPSemaphore);
-  }
-  /* USER CODE END ip_address_change_notify_callback */
+    /* Release the semaphore as soon as an IP address is available */
+    if (nx_ip_address_get(&app_ip_instance,
+                          &app_ip_address, &app_net_mask) != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+    if (app_ip_address != APP_NULL_IP_ADDRESS)
+    {
+        tx_semaphore_put(&app_dhcp_semaphore);
+    }
 }
 
-/**
-* @brief  Main thread entry.
-* @param thread_input: ULONG user argument used by the thread entry
-* @retval none
-*/
-static VOID nx_app_thread_entry (ULONG thread_input)
+static VOID app_main_thread_entry(ULONG thread_input)
 {
-  /* USER CODE BEGIN Nx_App_Thread_Entry 0 */
+    UINT ret = NX_SUCCESS;
 
-  /* USER CODE END Nx_App_Thread_Entry 0 */
+    /* Create a DNS client */
+    ret = app_dns_create(&app_dns_client);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
 
-  UINT ret = NX_SUCCESS;
+    /* Register the IP address change callback */
+    ret = nx_ip_address_change_notify(&app_ip_instance,
+                                      app_ip_address_change_cb, NULL);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
 
-  /* USER CODE BEGIN Nx_App_Thread_Entry 1 */
-  /* Create a DNS client */
-  ret = dns_create(&DnsClient);
+    /* Start the DHCP client */
+    printf("Looking for DHCP server ..\n");
+    ret = nx_dhcp_start(&app_dhcp_client);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+    
+    /* Wait until an IP address is ready */
+    if (tx_semaphore_get(&app_dhcp_semaphore, TX_WAIT_FOREVER) != TX_SUCCESS)
+    {
+        Error_Handler();
+    }
 
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-  /* USER CODE END Nx_App_Thread_Entry 1 */
+    PRINT_IP_ADDRESS(app_ip_address);
 
-  /* register the IP address change callback */
-  ret = nx_ip_address_change_notify(&NetXDuoEthIpInstance, ip_address_change_notify_callback, NULL);
-  if (ret != NX_SUCCESS)
-  {
-    /* USER CODE BEGIN IP address change callback error */
-    Error_Handler();
-    /* USER CODE END IP address change callback error */
-  }
+    /* Start the SNTP client thread */
+    tx_thread_resume(&app_sntp_thread);
 
-  /* start the DHCP client */
-  ret = nx_dhcp_start(&DHCPClient);
-  if (ret != NX_SUCCESS)
-  {
-    /* USER CODE BEGIN DHCP client start error */
-    Error_Handler();
-    /* USER CODE END DHCP client start error */
-  }
-  printf("Looking for DHCP server ..\n");
-  /* wait until an IP address is ready */
-  if(tx_semaphore_get(&DHCPSemaphore, TX_WAIT_FOREVER) != TX_SUCCESS)
-  {
-    /* USER CODE BEGIN DHCPSemaphore get error */
-    Error_Handler();
-    /* USER CODE END DHCPSemaphore get error */
-  }
-
-  /* USER CODE BEGIN Nx_App_Thread_Entry 2 */
-  PRINT_IP_ADDRESS(IpAddress);
-
-  /* Start the SNTP client thread */
-  tx_thread_resume(&AppSNTPThread);
-
-  /* This thread is not needed any more, we relinquish it */
-  tx_thread_relinquish();
-  /* USER CODE END Nx_App_Thread_Entry 2 */
-
-}
-/* USER CODE BEGIN 2 */
-
-/**
-* @brief  DNS Create Function.
-* @param dns_ptr
-* @retval ret
-*/
-UINT dns_create(NX_DNS *dns_ptr)
-{
-  UINT ret = NX_SUCCESS;
-
-  /* Create a DNS instance for the Client */
-  ret = nx_dns_create(dns_ptr, &NetXDuoEthIpInstance, (UCHAR *)"DNS Client");
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-  /* Initialize DNS instance with a dummy server */
-  ret = nx_dns_server_add(dns_ptr, USER_DNS_ADDRESS);
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  return ret;
+    /* This thread is not needed any more, we relinquish it */
+    tx_thread_relinquish();
 }
 
-/* Declare the disconnect notify function. */
-static VOID my_disconnect_func(NXD_MQTT_CLIENT *client_ptr)
+UINT app_dns_create(NX_DNS *dns_ptr)
 {
-  NX_PARAMETER_NOT_USED(client_ptr);
+    UINT ret = NX_SUCCESS;
 
-#ifdef MOSQUITTO_MQTT_PUBLIC
-    printf("client disconnected from broker < %s >.\n", MQTT_BROKER_NAME);
-#else
-    printf("client disconnected from broker.\n");
-#endif
-    nxd_mqtt_client_disconnect(&MqttClient);
+    /* Create a DNS instance for the Client */
+    ret = nx_dns_create(dns_ptr, &app_ip_instance, (UCHAR *)"DNS client");
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    /* Initialize DNS instance with a dummy server */
+    ret = nx_dns_server_add(dns_ptr, APP_DNS_ADDRESS);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    return ret;
 }
 
-/* Declare the notify function. */
-static VOID my_notify_func(NXD_MQTT_CLIENT* client_ptr, UINT number_of_messages)
+static VOID app_mqtt_disconnect_cb(NXD_MQTT_CLIENT *client_ptr)
 {
-//	UINT topic_length, message_length;
-//	static UINT message_count = 0;
+    NX_PARAMETER_NOT_USED(client_ptr);
 
-  NX_PARAMETER_NOT_USED(client_ptr);
-  NX_PARAMETER_NOT_USED(number_of_messages);
-
-  tx_event_flags_set(&mqtt_app_flag, DEMO_MESSAGE_EVENT, TX_OR);
-
-//  nxd_mqtt_client_message_get(&MqttClient, topic_buffer, sizeof(topic_buffer), &topic_length,
-//                                message_buffer, sizeof(message_buffer), &message_length);
-//  printf("Message %d received: TOPIC = %s, MESSAGE = %s\n",
-//  		 message_count + 1, topic_buffer, message_buffer);
-//  message_count++;
-
-  return;
+    printf("Client disconnected from broker.\n");
+    nxd_mqtt_client_disconnect(&app_mqtt_client);
 }
 
-/**
-* @brief  message generation Function.
-* @param  RandomNbr
-* @retval none
-*/
-static UINT message_generate()
+static VOID app_mqtt_received_cb(NXD_MQTT_CLIENT *client_ptr,
+                                 UINT number_of_messages)
 {
-  uint32_t RandomNbr = 0;
+    NX_PARAMETER_NOT_USED(client_ptr);
+    NX_PARAMETER_NOT_USED(number_of_messages);
 
-  /* generate a random number */
-  if(HAL_RNG_GenerateRandomNumber(&hrng, &RandomNbr) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    tx_event_flags_set(&app_message_received_flag,
+                       APP_MQTT_MESSAGE_RECEIVED_EVENT, TX_OR);
 
-  return RandomNbr %= 50;
+    return;
+}
+
+static UINT app_message_generate_stub(void)
+{
+    uint32_t random_number = 0;
+
+    /* Generate a random number */
+    if (HAL_RNG_GenerateRandomNumber(&hrng, &random_number) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    return random_number %= 50;
 }
 
 /* Function (set by user) to call when TLS needs the current time. */
-ULONG nx_secure_tls_session_time_function(void)
+static ULONG app_tls_session_time_function(void)
 {
-  return (current_time);
+    return (app_sntp_time_from_epoch);
 }
 
 /* Callback to setup TLS parameters for secure MQTT connection. */
-static UINT tls_setup_callback(NXD_MQTT_CLIENT *client_pt,
-                        NX_SECURE_TLS_SESSION *TLS_session_ptr,
-                        NX_SECURE_X509_CERT *certificate_ptr,
-                        NX_SECURE_X509_CERT *trusted_certificate_ptr)
+static UINT app_tls_setup_callback(NXD_MQTT_CLIENT *client_pt,
+                                   NX_SECURE_TLS_SESSION *tls_session_ptr,
+                                   NX_SECURE_X509_CERT *certificate_ptr,
+                                   NX_SECURE_X509_CERT *trusted_certificate_ptr)
 {
-  UINT ret = NX_SUCCESS;
-  NX_PARAMETER_NOT_USED(client_pt);
+    UINT ret = NX_SUCCESS;
+    NX_PARAMETER_NOT_USED(client_pt);
 
-  /* Initialize TLS module */
-  nx_secure_tls_initialize();
+    /* Initialize TLS module */
+    nx_secure_tls_initialize();
 
-  /* Create a TLS session */
-  ret = nx_secure_tls_session_create(TLS_session_ptr, &nx_crypto_tls_ciphers,
-                                     crypto_metadata_client, sizeof(crypto_metadata_client));
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Need to allocate space for the certificate. */
-  memset((certificate_ptr), 0, sizeof(NX_SECURE_X509_CERT));
-
-  ret = nx_secure_tls_session_time_function_set(TLS_session_ptr, nx_secure_tls_session_time_function);
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Allocate space for packet reassembly. */
-  ret = nx_secure_tls_session_packet_buffer_set(TLS_session_ptr, tls_packet_buffer,
-                                                sizeof(tls_packet_buffer));
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* allocate space for the certificate coming in from the remote host */
-  ret = nx_secure_tls_remote_certificate_allocate(TLS_session_ptr, certificate_ptr,
-                                                  tls_packet_buffer, sizeof(tls_packet_buffer));
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* initialize Certificate to verify incoming server certificates. */
-  ret = nx_secure_x509_certificate_initialize(trusted_certificate_ptr, (UCHAR*)mosquitto_org_der,
-                                              mosquitto_org_der_len, NX_NULL, 0, NULL, 0,
-                                              NX_SECURE_X509_KEY_TYPE_NONE);
-  if (ret != NX_SUCCESS)
-  {
-    printf("Certificate issue..\nPlease make sure that your X509_certificate is valid. \n");
-    Error_Handler();
-  }
-
-  /* Add a CA Certificate to our trusted store */
-
-  ret = nx_secure_tls_trusted_certificate_add(TLS_session_ptr, trusted_certificate_ptr);
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  return ret;
-}
-
-/* This callback defined handler for notifying SNTP time update event.  */
-static VOID time_update_callback(NX_SNTP_TIME_MESSAGE *time_update_ptr, NX_SNTP_TIME *local_time)
-{
-  NX_PARAMETER_NOT_USED(time_update_ptr);
-
-  printf("SNTP time update: %lu\n", local_time->seconds);
-  current_time = local_time->seconds - EPOCH_TIME_DIFF;
-}
-
-/** @brief  SNTP Client thread entry.
-* @param thread_input: ULONG user argument used by the thread entry
-* @retval none
-*/
-static VOID App_SNTP_Thread_Entry(ULONG thread_input)
-{
-  UINT ret;
-  NXD_ADDRESS sntp_server_ip;
-
-  sntp_server_ip.nxd_ip_version = 4;
-
-  do
-  {
-	  /* Look up SNTP Server address until success. */
-	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)SNTP_SERVER_NAME, &sntp_server_ip.nxd_ip_address.v4, DEFAULT_TIMEOUT);
-	  if (ret != NX_SUCCESS)
-	  {
-		tx_thread_sleep(DEFAULT_TIMEOUT);
-	  }
-  }
-  while (ret != NX_SUCCESS);
-
-  /* Create the SNTP Client */
-  ret =  nx_sntp_client_create(&SntpClient, &NetXDuoEthIpInstance, 0, &NxAppPool, NULL, NULL, NULL);
-
-  /* Check for error. */
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Setup time update callback function. */
-  nx_sntp_client_set_time_update_notify(&SntpClient, time_update_callback);
-
-  /* Use the IPv4 service to set up the Client and set the IPv4 SNTP server. */
-  ret = nx_sntp_client_initialize_unicast(&SntpClient, sntp_server_ip.nxd_ip_address.v4);
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Run whichever service the client is configured for. */
-  ret = nx_sntp_client_run_unicast(&SntpClient);
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  do
-  {
-    ret = nx_sntp_client_request_unicast_time(&SntpClient, SNTP_CLIENT_REQUEST_TIMEOUT);
+    /* Create a TLS session */
+    ret = nx_secure_tls_session_create(tls_session_ptr,
+                                       &nx_crypto_tls_ciphers,
+                                       app_crypto_metadata_client,
+                                       sizeof(app_crypto_metadata_client));
     if (ret != NX_SUCCESS)
     {
-    	tx_thread_sleep(DEFAULT_TIMEOUT);
+        Error_Handler();
     }
-  }
-  while (ret != NX_SUCCESS);
 
-  /* start the MQTT client thread */
-  tx_thread_resume(&AppMqttReconnectThread);
+    /* Need to allocate space for the certificate. */
+    memset((certificate_ptr), 0, sizeof(NX_SECURE_X509_CERT));
+    ret = nx_secure_tls_session_time_function_set(tls_session_ptr,
+                                                  app_tls_session_time_function);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
 
+    /* Allocate space for packet reassembly. */
+    ret = nx_secure_tls_session_packet_buffer_set(tls_session_ptr,
+                                                  app_tls_packet_buffer,
+                                                  sizeof(app_tls_packet_buffer));
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    /* Allocate space for the certificate coming in from the remote host */
+    ret = nx_secure_tls_remote_certificate_allocate(tls_session_ptr,
+                                                    certificate_ptr,
+                                                    app_tls_packet_buffer,
+                                                    sizeof(app_tls_packet_buffer));
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    /* Initialize Certificate to verify incoming server certificates. */
+    ret = nx_secure_x509_certificate_initialize(trusted_certificate_ptr,
+                                                (UCHAR *)mosquitto_org_der,
+                                                mosquitto_org_der_len,
+                                                NX_NULL, 0, NULL, 0,
+                                                NX_SECURE_X509_KEY_TYPE_NONE);
+    if (ret != NX_SUCCESS)
+    {
+        printf("Certificate issue..\nPlease make sure that your X509_certificate is valid.\n");
+        Error_Handler();
+    }
+
+    /* Add a CA Certificate to our trusted store */
+    ret = nx_secure_tls_trusted_certificate_add(tls_session_ptr,
+                                                trusted_certificate_ptr);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    return ret;
+}
+
+static VOID app_sntp_time_update_cb(NX_SNTP_TIME_MESSAGE *time_update_ptr,
+                                    NX_SNTP_TIME *local_time)
+{
+    NX_PARAMETER_NOT_USED(time_update_ptr);
+
+    printf("SNTP time update: %lu\n", local_time->seconds);
+    app_sntp_time_from_epoch = local_time->seconds - APP_EPOCH_TIME_DIFF;
+}
+
+static VOID app_sntp_thread_entry(ULONG thread_input)
+{
+    UINT ret;
+    NXD_ADDRESS sntp_server_ip;
+
+    sntp_server_ip.nxd_ip_version = 4;
+    do
+    {
+        /* Look up SNTP Server address until success. */
+        ret = nx_dns_host_by_name_get(&app_dns_client,
+                                      (UCHAR *)APP_SNTP_SERVER_NAME,
+                                      &sntp_server_ip.nxd_ip_address.v4,
+                                      APP_DEFAULT_TIMEOUT);
+        if (ret != NX_SUCCESS)
+        {
+            tx_thread_sleep(APP_DEFAULT_TIMEOUT);
+        }
+    } while (ret != NX_SUCCESS);
+
+    /* Create the SNTP Client */
+    ret = nx_sntp_client_create(&app_sntp_client, &app_ip_instance,
+                                0, &app_packet_pool, NULL, NULL, NULL);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    /* Setup time update callback function. */
+    nx_sntp_client_set_time_update_notify(&app_sntp_client,
+                                          app_sntp_time_update_cb);
+
+    /* Use the IPv4 service to set up the client and set the IPv4 SNTP server. */
+    ret = nx_sntp_client_initialize_unicast(&app_sntp_client,
+                                            sntp_server_ip.nxd_ip_address.v4);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    /* Run whichever service the client is configured for. */
+    ret = nx_sntp_client_run_unicast(&app_sntp_client);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+    do
+    {
+        /* Get time from SNTP server until success */
+        ret = nx_sntp_client_request_unicast_time(&app_sntp_client,
+                                                  APP_SNTP_CLIENT_REQUEST_TIMEOUT);
+        if (ret != NX_SUCCESS)
+        {
+            tx_thread_sleep(APP_DEFAULT_TIMEOUT);
+        }
+    } while (ret != NX_SUCCESS);
+
+    /* Start the MQTT client thread */
+    tx_thread_resume(&app_mqtt_connection_check_thread);
 }
 
 static void send_device_report(void)
 {
-	lwjson_serializer_t serializer;
-	size_t outputBytes = 0;
-	CHAR report_topic[NXD_MQTT_MAX_TOPIC_NAME_LENGTH];
-	CHAR serialized_json[NXD_MQTT_MAX_MESSAGE_LENGTH];
-	lwjsonr_t res;
+    lwjson_serializer_t serializer;
+    size_t outputBytes = 0;
+    CHAR report_topic[APP_MQTT_MAX_TOPIC_LENGTH];
+    CHAR serialized_json[APP_MQTT_MAX_MESSAGE_LENGTH];
+    lwjsonr_t res;
 
-	if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
-	{
-		snprintf(report_topic, NXD_MQTT_MAX_TOPIC_NAME_LENGTH,
-				 "d2c/%s/report", DEVICE_ID);
+    if (app_mqtt_client.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
+    {
+        snprintf(report_topic, APP_MQTT_MAX_TOPIC_LENGTH,
+                 "d2c/%s/report", APP_DEVICE_ID);
 
-		/* Initialize serializer with output buffer */
-		res = lwjson_serializer_init(&serializer, serialized_json,
-									 NXD_MQTT_MAX_MESSAGE_LENGTH);
-		if (res != lwjsonOK) {
-			printf("Failed to initialize serializer: %d\n", res);
-			return;
-		}
+        /* Initialize serializer with output buffer */
+        res = lwjson_serializer_init(&serializer, serialized_json,
+                                     APP_MQTT_MAX_MESSAGE_LENGTH);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to initialize serializer: %d\n", res);
+            return;
+        }
 
-		/* Start root object */
-		res = lwjson_serializer_start_object(&serializer, NULL, 0);
-		if (res != lwjsonOK) {
-			printf("Failed to start object: %d\n", res);
-			return;
-		}
+        /* Start root object */
+        res = lwjson_serializer_start_object(&serializer, NULL, 0);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to start object: %d\n", res);
+            return;
+        }
 
+        /* Serialize property object */
+        res = lwjson_serializer_start_object(&serializer, "property",
+                                             strlen("property"));
+        if (res != lwjsonOK)
+        {
+            printf("Failed to start property: %d\n", res);
+            return;
+        }
+        /* Serialize led status */
+        // Pin high --> led off
+        // Pin low  --> led on
+        res = lwjson_serializer_add_bool(&serializer, "green_led",
+                                         strlen("green_led"),
+                                         (HAL_GPIO_ReadPin(GPIOC, LED_GREEN_Pin) ? 0 : 1));
+        if (res != lwjsonOK)
+        {
+            printf("Failed to add green led status: %d\n", res);
+            return;
+        }
+        res = lwjson_serializer_add_bool(&serializer, "red_led",
+                                         strlen("red_led"),
+                                         (HAL_GPIO_ReadPin(GPIOC, LED_RED_Pin) ? 0 : 1));
+        if (res != lwjsonOK)
+        {
+            printf("Failed to add red led status: %d\n", res);
+            return;
+        }
+        /* End property object */
+        res = lwjson_serializer_end_object(&serializer);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to end property: %d\n", res);
+            return;
+        }
 
-		/* Serialize property object */
-		res = lwjson_serializer_start_object(&serializer, "property", strlen("property"));
-		if (res != lwjsonOK) {
-			printf("Failed to start property: %d\n", res);
-			return;
-		}
-		/* Serialize led status */
-		// Pin high --> led off
-		// Pin low  --> led on
-		res = lwjson_serializer_add_bool(&serializer, "green_led", strlen("green_led"),
-										 (HAL_GPIO_ReadPin(GPIOC, LED_GREEN_Pin) ? 0 : 1));
-		if (res != lwjsonOK) {
-			printf("Failed to add green led status: %d\n", res);
-			return;
-		}
-		res = lwjson_serializer_add_bool(&serializer, "red_led", strlen("red_led"),
-										 (HAL_GPIO_ReadPin(GPIOC, LED_RED_Pin) ? 0 : 1));
-		if (res != lwjsonOK) {
-			printf("Failed to add red led status: %d\n", res);
-			return;
-		}
-		res = lwjson_serializer_end_object(&serializer);
-		if (res != lwjsonOK) {
-			printf("Failed to end property: %d\n", res);
-			return;
-		}
+        /* End root object */
+        res = lwjson_serializer_end_object(&serializer);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to end object: %d\n", res);
+            return;
+        }
 
-		/* End root object */
-		res = lwjson_serializer_end_object(&serializer);
-		if (res != lwjsonOK) {
-			printf("Failed to end object: %d\n", res);
-			return;
-		}
+        res = lwjson_serializer_finalize(&serializer, &outputBytes);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to finalize serializer: %d\n", res);
+            return;
+        }
 
-		res = lwjson_serializer_finalize(&serializer, &outputBytes);
-		if (res != lwjsonOK) {
-			printf("Failed to finalize serializer: %d\n", res);
-			return;
-		}
-		/* Ensure null termination */
-		serialized_json[outputBytes] = '\0';
-		printf("Serialize report string: %s\n", serialized_json);
+        /* Ensure null termination */
+        serialized_json[outputBytes] = '\0';
+        printf("Serialize report string: %s\n", serialized_json);
 
-		nxd_mqtt_client_publish(&MqttClient, report_topic,
-								strlen(report_topic),
-								(CHAR*)serialized_json, outputBytes,
-								NX_FALSE, QOS1, NX_WAIT_FOREVER);
-	}
+        nxd_mqtt_client_publish(&app_mqtt_client, report_topic,
+                                strlen(report_topic), (CHAR *)serialized_json,
+                                outputBytes, NX_FALSE, APP_MQTT_QOS1,
+                                NX_WAIT_FOREVER);
+    }
 }
 
 // Todo: MQTT client is not able to reconnect to broker. Need to understand root cause.
@@ -805,530 +765,524 @@ static void send_device_report(void)
 //    --> MQTT client state can be corrupt, consider solution to detect communication error with broker
 //        and restart SW using watchdog timer.
 
-static UINT connect_to_broker()
+static UINT connect_to_broker(void)
 {
-	CHAR allDeviceTopic[128];
-	NXD_ADDRESS mqtt_server_ip;
-	ULONG broker_addr;
-	UINT ret = NX_SUCCESS;
+    CHAR allDeviceTopic[APP_MQTT_MAX_TOPIC_LENGTH];
+    NXD_ADDRESS mqtt_server_ip;
+    ULONG broker_addr;
+    UINT ret = NX_SUCCESS;
 
 #ifdef MOSQUITTO_MQTT_PUBLIC
-  do
-  {
-	  /* Look up MQTT Server address until success. */
-	  ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)MQTT_BROKER_NAME,
-	                                &broker_addr, DEFAULT_TIMEOUT);
-	  if (ret != NX_SUCCESS)
-	  {
-		  tx_thread_sleep(DEFAULT_TIMEOUT);
-	  }
-  }
-  while (ret != NX_SUCCESS);
+    do
+    {
+        /* Look up MQTT Server address until success. */
+        ret = nx_dns_host_by_name_get(&DnsClient, (UCHAR *)MQTT_BROKER_NAME,
+                                      &broker_addr, APP_DEFAULT_TIMEOUT);
+        if (ret != NX_SUCCESS)
+        {
+            tx_thread_sleep(APP_DEFAULT_TIMEOUT);
+        }
+    } while (ret != NX_SUCCESS);
 #else
-	  broker_addr = LOCAL_SERVER_ADDRESS;
+    broker_addr = LOCAL_SERVER_ADDRESS;
 #endif
-	mqtt_server_ip.nxd_ip_version = 4;
-	mqtt_server_ip.nxd_ip_address.v4 = broker_addr;
-	nxd_mqtt_client_login_set(&MqttClient, DEVICE_ID, strlen(DEVICE_ID),
-			                  DEVICE_TOKEN, strlen(DEVICE_TOKEN));
+    mqtt_server_ip.nxd_ip_version = 4;
+    mqtt_server_ip.nxd_ip_address.v4 = broker_addr;
+    nxd_mqtt_client_login_set(&app_mqtt_client,
+                              APP_DEVICE_ID, strlen(APP_DEVICE_ID),
+                              APP_DEVICE_TOKEN, strlen(APP_DEVICE_TOKEN));
 
-	printf("Connecting to broker\n");
-	/* Start a secure connection to the server. */
-	ret = nxd_mqtt_client_secure_connect(&MqttClient, &mqtt_server_ip,
-			MQTT_PORT, tls_setup_callback,
-			MQTT_KEEP_ALIVE_TIMER, CLEAN_SESSION, NX_WAIT_FOREVER);
+    printf("Connecting to broker\n");
+    /* Start a secure connection to the server. */
+    ret = nxd_mqtt_client_secure_connect(&app_mqtt_client, &mqtt_server_ip,
+                                         APP_MQTT_PORT, app_tls_setup_callback,
+                                         APP_MQTT_KEEP_ALIVE_TIMER,
+                                         APP_MQTT_CLEAN_SESSION,
+                                         NX_WAIT_FOREVER);
+    if (ret != NX_SUCCESS)
+    {
+        printf("MQTT client failed to connect to broker 0x%x.\n", ret);
+        return ret;
+    }
+    else
+    {
+        printf("MQTT client connected to broker.\n");
+    }
 
-	if (ret != NX_SUCCESS) {
-	    printf("MQTT client failed to connect to broker 0x%x.\n", ret);
-		return ret;
-	} else {
-		printf("MQTT client connected to broker.\n");
-	}
+    /* Subscribe to the all topics related to device with QoS level 1. */
+    snprintf(allDeviceTopic, APP_MQTT_MAX_TOPIC_LENGTH,
+             "c2d/%s/#", APP_DEVICE_ID);
+    ret = nxd_mqtt_client_subscribe(&app_mqtt_client, allDeviceTopic,
+                                    strlen(allDeviceTopic), APP_MQTT_QOS1);
+    /** 
+     * Todo: How to handle error when subscribe failed?
+     * If cable disconnected and mqtt client status is CONNECTED,
+     * nxd_mqtt_client_subscribe() does not return error to user.
+     * Is it possible to subscribe failed, but mqtt client does not
+     * change status to DISCONNECTED?
+     * --> Device will never try to reconnect to broker and never
+     *     receive any messages from broker.
+     */
+    if (ret != NX_SUCCESS)
+    {
+        return ret;
+    }
 
-	/* Subscribe to the all topics related to device with QoS level 1. */
-	snprintf(allDeviceTopic, STRLEN(allDeviceTopic), "c2d/%s/#", DEVICE_ID);
-	ret = nxd_mqtt_client_subscribe(&MqttClient, allDeviceTopic,
-			                        strlen(allDeviceTopic), QOS1);
-
-	if (ret != NX_SUCCESS) {
-		//Error_Handler();
-		return ret;
-	}
-
-	return NX_SUCCESS;
+    return NX_SUCCESS;
 }
 
 static void add_report_request_to_queue(void)
 {
-	MQTT_SEND_MESSAGE *msg_ptr;
+    APP_SENDING_MESSAGE_INFO *msg_ptr;
 
-	// Allocate a block from the pool
-	if (tx_block_allocate(&send_message_block_pool, (VOID **)&msg_ptr, TX_NO_WAIT) == TX_SUCCESS)
-	{
-		msg_ptr->message_type = MSG_TYPE_SEND_REPORT_MESSAGE;
-
-		// Send the pointer through the queue
-		tx_queue_send(&MsgQueueOne, &msg_ptr, TX_WAIT_FOREVER);
-	}
-}
-
-static VOID App_Device_Report_Thread_Entry(ULONG thread_input)
-{
-	while (1)
-	{
-		add_report_request_to_queue();
-		// Send report every 60s
-		tx_thread_sleep(6000);
-	}
-}
-
-static void send_telemetry_data(MQTT_SEND_MESSAGE *msg_ptr)
-{
-	lwjson_serializer_t serializer;
-	size_t outputBytes = 0;
-	CHAR telemetry_topic[NXD_MQTT_MAX_TOPIC_NAME_LENGTH];
-	CHAR serialized_json[NXD_MQTT_MAX_MESSAGE_LENGTH];
-	lwjsonr_t res;
-
-	if (MqttClient.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
-	{
-		snprintf(telemetry_topic, NXD_MQTT_MAX_TOPIC_NAME_LENGTH,
-							 "d2c/%s/data", DEVICE_ID);
-
-		/* Initialize serializer with output buffer */
-		res = lwjson_serializer_init(&serializer, serialized_json,
-									 NXD_MQTT_MAX_MESSAGE_LENGTH);
-		if (res != lwjsonOK) {
-			printf("Failed to initialize serializer: %d\r\n", res);
-			return;
-		}
-
-		/* Start root object */
-		res = lwjson_serializer_start_object(&serializer, NULL, 0);
-		if (res != lwjsonOK) {
-			printf("Failed to start object: %d\r\n", res);
-			return;
-		}
-
-		res = lwjson_serializer_add_uint(&serializer, "Temperature", strlen("Temperature"),
-				                         msg_ptr->payload.temperature);
-		if (res != lwjsonOK) {
-			printf("Failed to add Temperature data: %d\n", res);
-			return;
-		}
-
-		/* End root object */
-		res = lwjson_serializer_end_object(&serializer);
-		if (res != lwjsonOK) {
-			printf("Failed to end object: %d\n", res);
-			return;
-		}
-
-		res = lwjson_serializer_finalize(&serializer, &outputBytes);
-		if (res != lwjsonOK) {
-			printf("Failed to finalize serializer: %d\n", res);
-			return;
-		}
-		/* Ensure null termination */
-		serialized_json[outputBytes] = '\0';
-		printf("Serialize data string: %s\n", serialized_json);
-
-		nxd_mqtt_client_publish(&MqttClient, telemetry_topic,
-								strlen(telemetry_topic),
-								(CHAR*)serialized_json, outputBytes,
-								NX_FALSE, QOS1, NX_WAIT_FOREVER);
-	}
-}
-
-static VOID App_Telemetry_Data_Thread_Entry(ULONG thread_input)
-{
-	MQTT_SEND_MESSAGE *msg_ptr;
-	UINT aRandom32bit;
-
-	while (1)
-	{
-		aRandom32bit = message_generate();
-		printf("Random 32 bit: %u\n", aRandom32bit);
-
-		// Allocate a block from the pool
-		if (tx_block_allocate(&send_message_block_pool, (VOID **)&msg_ptr, TX_NO_WAIT) == TX_SUCCESS)
-		{
-			msg_ptr->message_type = MSG_TYPE_SEND_TELEMETRY_DATA;
-			msg_ptr->payload.temperature = aRandom32bit;
-
-			// Send the pointer through the queue
-			tx_queue_send(&MsgQueueOne, &msg_ptr, TX_WAIT_FOREVER);
-		}
-		// Send data every 10s.
-		tx_thread_sleep(1000);
-	}
-}
-
-static VOID App_Send_Message_Thread_Entry(ULONG thread_input)
-{
-	MQTT_SEND_MESSAGE *received_msg_ptr;
-
-	while (1)
-	{
-		// Wait for a pointer message to arrive
-		if (tx_queue_receive(&MsgQueueOne, &received_msg_ptr, TX_WAIT_FOREVER) == TX_SUCCESS)
-		{
-			// Handle based on message type
-			switch (received_msg_ptr->message_type)
-			{
-				case MSG_TYPE_SEND_REPORT_MESSAGE:
-					send_device_report();
-					break;
-
-				case MSG_TYPE_SEND_TELEMETRY_DATA:
-					send_telemetry_data(received_msg_ptr);
-					break;
-				default:
-					break;
-			}
-
-			// CRITICAL: Always release the block back to the pool after processing
-			tx_block_release(received_msg_ptr);
-		}
-	}
-}
-
-/**
-* @brief  MQTT Client thread entry.
-* @param thread_input: ULONG user argument used by the thread entry
-* @retval none
-*/
-static VOID App_MQTT_Client_Thread_Entry(ULONG thread_input)
-{
-  UINT ret = NX_SUCCESS;
-  ULONG events;
-  UINT topic_length, message_length;
-  UINT remaining_msg = NB_MESSAGE;
-  UINT unlimited_publish = NX_FALSE;
-  UINT message_count = 0;
-  CHAR cmp_topic[128];
-
-
-
-  if (NB_MESSAGE ==0)
-    unlimited_publish = NX_TRUE;
-
-  while(unlimited_publish || remaining_msg)
-  {
-	  /* wait for the broker to publish the message. */
-	  tx_event_flags_get(&mqtt_app_flag, DEMO_ALL_EVENTS, TX_OR_CLEAR, &events, TX_WAIT_FOREVER);
-
-	  /* check event received */
-	  if(events & DEMO_MESSAGE_EVENT)
-	  {
-		/* get message from the broker */
-		ret = nxd_mqtt_client_message_get(&MqttClient, topic_buffer, sizeof(topic_buffer), &topic_length,
-										  message_buffer, sizeof(message_buffer), &message_length);
-		if(ret == NXD_MQTT_SUCCESS)
-		{
-		  printf("Message %d received: TOPIC = %s, MESSAGE = %s\n", message_count + 1, topic_buffer, message_buffer);
-		  if (lwjson_parse_ex(&lwjson, (CHAR *)message_buffer, message_length) == lwjsonOK)
-		  {
-			  const lwjson_token_t* top_obj;
-
-			  // Device receive control command message
-			  snprintf(cmp_topic, STRLEN(cmp_topic), "c2d/%s/command", DEVICE_ID);
-			  if ((strncmp((CHAR *)topic_buffer, cmp_topic, topic_length) == 0) &&
-				  (strlen(cmp_topic) == topic_length))
-			  {
-				  /* Get very first token as top object */
-				  top_obj = lwjson_get_first_token(&lwjson);
-				  if (top_obj->type == LWJSON_TYPE_OBJECT)
-				  {
-					  const lwjson_token_t* tk_name;
-					  const lwjson_token_t* tk_led_type;
-
-					  // Find command name
-					  tk_name = lwjson_find(&lwjson, "name");
-					  if ((tk_name != NULL) && (tk_name->type == LWJSON_TYPE_STRING))
-					  {
-						  //printf("Token: %.*s\n", (int)tk_name->token_name_len, tk_name->token_name);
-						  //printf("Value: %.*s\n", (int)tk_name->u.str.token_value_len, tk_name->u.str.token_value);
-						  if ((strncmp(tk_name->u.str.token_value, "turn_on_led", tk_name->u.str.token_value_len) == 0) &&
-							  (tk_name->u.str.token_value_len == strlen("turn_on_led")))
-						  {
-							  // Find LED type
-							  tk_led_type = lwjson_find(&lwjson, "type");
-							  if ((tk_led_type != NULL) && (tk_led_type->type == LWJSON_TYPE_STRING))
-							  {
-								  if ((strncmp(tk_led_type->u.str.token_value, "green", tk_led_type->u.str.token_value_len) == 0) &&
-									  (tk_led_type->u.str.token_value_len == strlen("green")))
-								  {
-									  HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_RESET);
-									  // Change led state, send report to update all clients.
-									  add_report_request_to_queue();
-								  }
-								  else if ((strncmp(tk_led_type->u.str.token_value, "red", tk_led_type->u.str.token_value_len) == 0) &&
-										   (tk_led_type->u.str.token_value_len == strlen("red")))
-								  {
-									  HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_RESET);
-									  // Change led state, send report to update all clients.
-									  add_report_request_to_queue();
-								  }
-								  else
-								  {
-									  printf("Unknown led type\n");
-								  }
-							  }
-						  }
-						  else if ((strncmp(tk_name->u.str.token_value, "turn_off_led", tk_name->u.str.token_value_len) == 0) &&
-								   (tk_name->u.str.token_value_len == strlen("turn_off_led")))
-						  {
-							  if ((strncmp(tk_led_type->u.str.token_value, "green", tk_led_type->u.str.token_value_len) == 0) &&
-								  (tk_led_type->u.str.token_value_len == strlen("green")))
-							  {
-								  HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_SET);
-								  // Change led state, send report to update all clients.
-								  add_report_request_to_queue();
-							  }
-							  else if ((strncmp(tk_led_type->u.str.token_value, "red", tk_led_type->u.str.token_value_len) == 0) &&
-									   (tk_led_type->u.str.token_value_len == strlen("red")))
-							  {
-								  HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_SET);
-								  // Change led state, send report to update all clients.
-								  add_report_request_to_queue();
-							  }
-							  else
-							  {
-								  printf("Unknown led type\n");
-							  }
-						  }
-						  else
-						  {
-							  printf("Unknown command\n");
-						  }
-					  }
-					  else
-					  {
-						  printf("Not found command name\n");
-					  }
-				  }
-				  continue;
-			  }
-
-			  // Device receive status report request
-			  snprintf(cmp_topic, STRLEN(cmp_topic), "c2d/%s/report", DEVICE_ID);
-			  if ((strncmp((CHAR *)topic_buffer, cmp_topic, topic_length) == 0) &&
-				  (strlen(cmp_topic) == topic_length))
-			  {
-				  /* Get very first token as top object */
-				  top_obj = lwjson_get_first_token(&lwjson);
-				  if (top_obj->type == LWJSON_TYPE_OBJECT)
-				  {
-					  const lwjson_token_t* tk_topic;
-					  const lwjson_token_t* tk_topic_element;
-
-					  // Find topic
-					  tk_topic = lwjson_find(&lwjson, "topic");
-					  if ((tk_topic != NULL) && (tk_topic->type == LWJSON_TYPE_ARRAY))
-					  {
-						  for (tk_topic_element = lwjson_get_first_child(tk_topic); tk_topic_element != NULL; tk_topic_element = tk_topic_element->next)
-						  {
-							  // Report device status
-							  if ((tk_topic_element->type == LWJSON_TYPE_STRING) &&
-								  (strncmp(tk_topic_element->u.str.token_value, "property", tk_topic_element->u.str.token_value_len) == 0) &&
-								  (strlen("property") == tk_topic_element->u.str.token_value_len))
-							  {
-								  // Add the request to send the report by other thread.
-								  add_report_request_to_queue();
-							  }
-						  }
-					  }
-
-				  }
-				  continue;
-			  }
-		  }
-		}
-		else
-		{
-		  Error_Handler();
-		}
-		message_count++;
-	  }
-
-
-    /* Delay 5s between each pub */
-    tx_thread_sleep(500);
-  }
-
-	/* send an empty message at the end of the session to avoid the "Retain" message behavior */
-  ret = nxd_mqtt_client_publish(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME), NULL, 0, NX_FALSE, QOS1, NX_WAIT_FOREVER);
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Now unsubscribe the topic. */
-  ret = nxd_mqtt_client_unsubscribe(&MqttClient, TOPIC_NAME, STRLEN(TOPIC_NAME));
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Disconnect from the broker. */
-  ret = nxd_mqtt_client_disconnect(&MqttClient);
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* Delete the client instance, release all the resources. */
-  ret = nxd_mqtt_client_delete(&MqttClient);
-
-  if (ret != NX_SUCCESS)
-  {
-    Error_Handler();
-  }
-
-  /* test OK -> success Handler */
-  Success_Handler();
-}
-
-static VOID App_MQTT_Reconnect_Thread_Entry(ULONG thread_input)
-{
-	UINT ret = NX_SUCCESS;
-
-	/* Initialize and pass statically allocated tokens */
-	  lwjson_init(&lwjson, tokens, LWJSON_ARRAYSIZE(tokens));
-
-	  /* Create MQTT client instance. */
-	  ret = nxd_mqtt_client_create(&MqttClient, "my_client", DEVICE_ID, STRLEN(DEVICE_ID),
-	                               &NetXDuoEthIpInstance, &NxAppPool, (VOID*)mqtt_client_stack, MQTT_CLIENT_STACK_SIZE,
-	                               MQTT_THREAD_PRIORTY, NX_NULL, 0);
-	  if (ret != NX_SUCCESS)
-	  {
-	    Error_Handler();
-	  }
-
-	#if 0
-	  /**
-	   * Should use periodic report message for device online/offline detection.
-	   *
-	   * Observed will message behavior with Mosquitto broker:
-	   * - Will message will be published after (1.5 x keep alive) period (set when connect to broker).
-	   * - If device reconnect (resends CONNECT message) to broker within (1.5 x keep alive) period,
-	   *   user receive unexpected will message.
-	   * - If device reconnect (resends CONNECT message) to broker after (1.5 x keep alive) period,
-	   *   broker will not publish will message.
-	   */
-	  snprintf(cmp_topic, STRLEN(cmp_topic), "d2c/%s/status", DEVICE_ID);
-	  nxd_mqtt_client_will_message_set(&MqttClient, (UCHAR*)cmp_topic, strlen(cmp_topic),
-			                           (UCHAR*)"offline", strlen("offline"), NX_FALSE, QOS1);
-	#endif
-
-	  /* Register the disconnect notification function. */
-	  nxd_mqtt_client_disconnect_notify_set(&MqttClient, my_disconnect_func);
-
-	  /* Set the receive notify function. */
-	  nxd_mqtt_client_receive_notify_set(&MqttClient, my_notify_func);
-
-	  /* Create an MQTT flag */
-	  ret = tx_event_flags_create(&mqtt_app_flag, "my app event");
-	  if (ret != TX_SUCCESS)
-	  {
-	    Error_Handler();
-	  }
-	  connect_to_broker();
-	  tx_thread_resume(&AppTelemetryDataThread);
-	  tx_thread_resume(&AppDeviceReportThread);
-	  tx_thread_resume(&AppMQTTClientThread);
-	  tx_thread_resume(&AppSendingMessageThread);
-
-	while (1)
-	{
-		if ((MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&
-			(MqttClient.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
-		{
-			connect_to_broker();
-			// Check connection every 5s.
-			tx_thread_sleep(500);
-		}
-	}
-}
-
-/**
-* @brief  Link thread entry
-* @param thread_input: ULONG thread parameter
-* @retval none
-*/
-static VOID App_Link_Thread_Entry(ULONG thread_input)
-{
-  ULONG actual_status;
-  UINT linkdown = 0, status;
-
-  while(1)
-  {
-    /* Send request to check if the Ethernet cable is connected. */
-    status = nx_ip_interface_status_check(&NetXDuoEthIpInstance, 0, NX_IP_LINK_ENABLED,
-                                      &actual_status, 10);
-
-    if(status == NX_SUCCESS)
+    /* Allocate a message from the pool */
+    if (tx_block_allocate(&app_message_block_pool,
+                          (VOID **)&msg_ptr, TX_NO_WAIT) == TX_SUCCESS)
     {
-      if(linkdown == 1)
-      {
-        linkdown = 0;
+        msg_ptr->message_type = APP_MESSAGE_TYPE_SEND_REPORT;
 
-        /* The network cable is connected. */
-        printf("The network cable is connected.\n");
+        /* Send the pointer through the queue */
+        tx_queue_send(&app_send_message_queue, &msg_ptr, TX_WAIT_FOREVER);
+    }
+}
 
-        /* Send request to enable PHY Link. */
-        nx_ip_driver_direct_command(&NetXDuoEthIpInstance, NX_LINK_ENABLE,
-                                      &actual_status);
+static VOID app_device_report_thread_entry(ULONG thread_input)
+{
+    while (1)
+    {
+        add_report_request_to_queue();
+        /* Send report every 60s */
+        tx_thread_sleep(6000);
+    }
+}
 
-        /* Send request to check if an address is resolved. */
-        status = nx_ip_interface_status_check(&NetXDuoEthIpInstance, 0, NX_IP_ADDRESS_RESOLVED,
-                                      &actual_status, 10);
-        if(status == NX_SUCCESS)
+static void send_telemetry_data(APP_SENDING_MESSAGE_INFO *msg_ptr)
+{
+    lwjson_serializer_t serializer;
+    size_t outputBytes = 0;
+    CHAR telemetry_topic[APP_MQTT_MAX_TOPIC_LENGTH];
+    CHAR serialized_json[APP_MQTT_MAX_MESSAGE_LENGTH];
+    lwjsonr_t res;
+
+    if (app_mqtt_client.nxd_mqtt_client_state == NXD_MQTT_CLIENT_STATE_CONNECTED)
+    {
+        snprintf(telemetry_topic, APP_MQTT_MAX_TOPIC_LENGTH,
+                 "d2c/%s/data", APP_DEVICE_ID);
+
+        /* Initialize serializer with output buffer */
+        res = lwjson_serializer_init(&serializer, serialized_json,
+                                     APP_MQTT_MAX_MESSAGE_LENGTH);
+        if (res != lwjsonOK)
         {
-          /* Stop DHCP */
-          nx_dhcp_stop(&DHCPClient);
+            printf("Failed to initialize serializer: %d\n", res);
+            return;
+        }
 
-          /* Reinitialize DHCP */
-          nx_dhcp_reinitialize(&DHCPClient);
+        /* Start root object */
+        res = lwjson_serializer_start_object(&serializer, NULL, 0);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to start object: %d\n", res);
+            return;
+        }
 
-          /* Start DHCP */
-          nx_dhcp_start(&DHCPClient);
+        res = lwjson_serializer_add_uint(&serializer, "Temperature",
+                                         strlen("Temperature"),
+                                         msg_ptr->payload.temperature);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to add Temperature data: %d\n", res);
+            return;
+        }
 
-          /* Wait until an IP address is ready */
-          if(tx_semaphore_get(&DHCPSemaphore, TX_WAIT_FOREVER) != TX_SUCCESS)
-          {
-            /* USER CODE BEGIN DHCPSemaphore get error */
-            Error_Handler();
-            /* USER CODE END DHCPSemaphore get error */
-          }
+        /* End root object */
+        res = lwjson_serializer_end_object(&serializer);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to end object: %d\n", res);
+            return;
+        }
 
-          PRINT_IP_ADDRESS(IpAddress);
+        res = lwjson_serializer_finalize(&serializer, &outputBytes);
+        if (res != lwjsonOK)
+        {
+            printf("Failed to finalize serializer: %d\n", res);
+            return;
+        }
+
+        /* Ensure null termination */
+        serialized_json[outputBytes] = '\0';
+        printf("Serialize data string: %s\n", serialized_json);
+
+        nxd_mqtt_client_publish(&app_mqtt_client, telemetry_topic,
+                                strlen(telemetry_topic),
+                                (CHAR *)serialized_json,
+                                outputBytes,
+                                NX_FALSE,
+                                APP_MQTT_QOS1,
+                                NX_WAIT_FOREVER);
+    }
+}
+
+static VOID app_telemetry_data_thread_entry(ULONG thread_input)
+{
+    APP_SENDING_MESSAGE_INFO *msg_ptr;
+    UINT temprature_val;
+
+    while (1)
+    {
+        temprature_val = app_message_generate_stub();
+
+        /* Allocate a message from the pool */
+        if (tx_block_allocate(&app_message_block_pool,
+                              (VOID **)&msg_ptr, TX_NO_WAIT) == TX_SUCCESS)
+        {
+            msg_ptr->message_type = APP_MESSAGE_TYPE_SEND_TELEMETRY_DATA;
+            msg_ptr->payload.temperature = temprature_val;
+
+            /* Send the pointer through the queue */
+            tx_queue_send(&app_send_message_queue, &msg_ptr, TX_WAIT_FOREVER);
+        }
+        /* Send data every 10s */
+        tx_thread_sleep(1000);
+    }
+}
+
+static VOID app_send_message_thread_entry(ULONG thread_input)
+{
+    APP_SENDING_MESSAGE_INFO *received_msg_ptr;
+
+    while (1)
+    {
+        /* Wait for a pointer message to arrive */
+        if (tx_queue_receive(&app_send_message_queue,
+                             &received_msg_ptr, TX_WAIT_FOREVER) == TX_SUCCESS)
+        {
+            /* Handle based on message type */
+            switch (received_msg_ptr->message_type)
+            {
+            case APP_MESSAGE_TYPE_SEND_REPORT:
+                send_device_report();
+                break;
+            case APP_MESSAGE_TYPE_SEND_TELEMETRY_DATA:
+                send_telemetry_data(received_msg_ptr);
+                break;
+            default:
+                break;
+            }
+
+            /* CRITICAL: Always release the block back to the pool after processing */
+            tx_block_release(received_msg_ptr);
+        }
+    }
+}
+
+static VOID app_process_received_message_thread_entry(ULONG thread_input)
+{
+    ULONG events;
+    UINT topic_length, message_length;
+    CHAR cmp_topic[APP_MQTT_MAX_TOPIC_LENGTH];
+    UCHAR message_buffer[APP_MQTT_MAX_MESSAGE_LENGTH];
+    UCHAR topic_buffer[APP_MQTT_MAX_TOPIC_LENGTH];
+    UINT ret = NX_SUCCESS;
+
+    while (1)
+    {
+        /* wait for the broker to publish the message. */
+        tx_event_flags_get(&app_message_received_flag,
+                           APP_MQTT_MESSAGE_RECEIVED_EVENT,
+                           TX_OR_CLEAR, &events, TX_WAIT_FOREVER);
+
+        /* Check event received */
+        if (events & APP_MQTT_MESSAGE_RECEIVED_EVENT)
+        {
+            /* Get message from the broker */
+            ret = nxd_mqtt_client_message_get(&app_mqtt_client,
+                                              topic_buffer,
+                                              sizeof(topic_buffer),
+                                              &topic_length,
+                                              message_buffer,
+                                              sizeof(message_buffer),
+                                              &message_length);
+            if (ret == NXD_MQTT_SUCCESS)
+            {
+                if (lwjson_parse_ex(&app_lwjson,
+                                    (CHAR *)message_buffer,
+                                    message_length) == lwjsonOK)
+                {
+                    const lwjson_token_t *top_obj;
+
+                    /* Device receives command from broker */
+                    snprintf(cmp_topic, APP_MQTT_MAX_TOPIC_LENGTH,
+                             "c2d/%s/command", APP_DEVICE_ID);
+                    if ((strncmp((CHAR *)topic_buffer, cmp_topic, topic_length) == 0) &&
+                        (strlen(cmp_topic) == topic_length))
+                    {
+                        /* Get very first token as top object */
+                        top_obj = lwjson_get_first_token(&app_lwjson);
+                        if (top_obj->type == LWJSON_TYPE_OBJECT)
+                        {
+                            const lwjson_token_t *tk_name;
+                            const lwjson_token_t *tk_led_type;
+
+                            /* Find command name */
+                            tk_name = lwjson_find(&app_lwjson, "name");
+                            if ((tk_name != NULL) && (tk_name->type == LWJSON_TYPE_STRING))
+                            {
+                                if ((strncmp(tk_name->u.str.token_value, "turn_on_led",
+                                             tk_name->u.str.token_value_len) == 0) &&
+                                    (tk_name->u.str.token_value_len == strlen("turn_on_led")))
+                                {
+                                    // Find LED type
+                                    tk_led_type = lwjson_find(&app_lwjson, "type");
+                                    if ((tk_led_type != NULL) && (tk_led_type->type == LWJSON_TYPE_STRING))
+                                    {
+                                        if ((strncmp(tk_led_type->u.str.token_value, "green",
+                                                     tk_led_type->u.str.token_value_len) == 0) &&
+                                            (tk_led_type->u.str.token_value_len == strlen("green")))
+                                        {
+                                            HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_RESET);
+                                            // Change led state, send report to update all clients.
+                                            add_report_request_to_queue();
+                                        }
+                                        else if ((strncmp(tk_led_type->u.str.token_value, "red",
+                                                          tk_led_type->u.str.token_value_len) == 0) &&
+                                                 (tk_led_type->u.str.token_value_len == strlen("red")))
+                                        {
+                                            HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_RESET);
+                                            // Change led state, send report to update all clients.
+                                            add_report_request_to_queue();
+                                        }
+                                        else
+                                        {
+                                            printf("Unknown led type\n");
+                                        }
+                                    }
+                                }
+                                else if ((strncmp(tk_name->u.str.token_value, "turn_off_led",
+                                                  tk_name->u.str.token_value_len) == 0) &&
+                                         (tk_name->u.str.token_value_len == strlen("turn_off_led")))
+                                {
+                                    if ((strncmp(tk_led_type->u.str.token_value, "green",
+                                                 tk_led_type->u.str.token_value_len) == 0) &&
+                                        (tk_led_type->u.str.token_value_len == strlen("green")))
+                                    {
+                                        HAL_GPIO_WritePin(GPIOC, LED_GREEN_Pin, GPIO_PIN_SET);
+                                        // Change led state, send report to update all clients.
+                                        add_report_request_to_queue();
+                                    }
+                                    else if ((strncmp(tk_led_type->u.str.token_value, "red",
+                                                      tk_led_type->u.str.token_value_len) == 0) &&
+                                             (tk_led_type->u.str.token_value_len == strlen("red")))
+                                    {
+                                        HAL_GPIO_WritePin(GPIOC, LED_RED_Pin, GPIO_PIN_SET);
+                                        // Change led state, send report to update all clients.
+                                        add_report_request_to_queue();
+                                    }
+                                    else
+                                    {
+                                        printf("Unknown led type\n");
+                                    }
+                                }
+                                else
+                                {
+                                    printf("Unknown command\n");
+                                }
+                            }
+                            else
+                            {
+                                printf("Not found command name\n");
+                            }
+                        }
+                        continue;
+                    }
+
+                    /* Device receives status report request */
+                    snprintf(cmp_topic, APP_MQTT_MAX_TOPIC_LENGTH,
+                             "c2d/%s/report", APP_DEVICE_ID);
+                    if ((strncmp((CHAR *)topic_buffer, cmp_topic, topic_length) == 0) &&
+                        (strlen(cmp_topic) == topic_length))
+                    {
+                        /* Get very first token as top object */
+                        top_obj = lwjson_get_first_token(&app_lwjson);
+                        if (top_obj->type == LWJSON_TYPE_OBJECT)
+                        {
+                            const lwjson_token_t *tk_topic;
+                            const lwjson_token_t *tk_topic_element;
+
+                            // Find topic
+                            tk_topic = lwjson_find(&app_lwjson, "topic");
+                            if ((tk_topic != NULL) && (tk_topic->type == LWJSON_TYPE_ARRAY))
+                            {
+                                for (tk_topic_element = lwjson_get_first_child(tk_topic);
+                                     tk_topic_element != NULL;
+                                     tk_topic_element = tk_topic_element->next)
+                                {
+                                    // Report device status
+                                    if ((tk_topic_element->type == LWJSON_TYPE_STRING) &&
+                                        (strncmp(tk_topic_element->u.str.token_value, "property",
+                                                 tk_topic_element->u.str.token_value_len) == 0) &&
+                                        (strlen("property") == tk_topic_element->u.str.token_value_len))
+                                    {
+                                        // Add the request to send the report.
+                                        add_report_request_to_queue();
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            else
+            {
+                Error_Handler();
+            }
+        }
+    }
+}
+
+static VOID app_mqtt_connection_check_thread_entry(ULONG thread_input)
+{
+    UINT ret = NX_SUCCESS;
+
+    /* Initialize lwjson and pass statically allocated tokens */
+    lwjson_init(&app_lwjson, app_tokens_buffer,
+                LWJSON_ARRAYSIZE(app_tokens_buffer));
+
+    /* Create MQTT client instance. */
+    ret = nxd_mqtt_client_create(&app_mqtt_client, "MQTT client",
+                                 APP_DEVICE_ID, strlen(APP_DEVICE_ID),
+                                 &app_ip_instance, &app_packet_pool,
+                                 (VOID *)app_mqtt_client_stack,
+                                 APP_MQTT_CLIENT_THREAD_STACK_SIZE,
+                                 APP_MQTT_CLIENT_THREAD_PRIORTY, NX_NULL, 0);
+    if (ret != NX_SUCCESS)
+    {
+        Error_Handler();
+    }
+
+#if 0
+      /**
+       * Should use periodic report message for device online/offline detection.
+       *
+       * Observed will message behavior with Mosquitto broker:
+       * - Will message will be published after (1.5 x keep alive) period (set when connect to broker).
+       * - If device reconnect (resends CONNECT message) to broker within (1.5 x keep alive) period,
+       *   user receive unexpected will message.
+       * - If device reconnect (resends CONNECT message) to broker after (1.5 x keep alive) period,
+       *   broker will not publish will message.
+       */
+      snprintf(cmp_topic, STRLEN(cmp_topic), "d2c/%s/status", APP_DEVICE_ID);
+      nxd_mqtt_client_will_message_set(&MqttClient, (UCHAR*)cmp_topic, strlen(cmp_topic),
+                                       (UCHAR*)"offline", strlen("offline"), NX_FALSE, APP_MQTT_QOS1);
+#endif
+
+    /* Register the disconnect notification function. */
+    nxd_mqtt_client_disconnect_notify_set(&app_mqtt_client,
+                                          app_mqtt_disconnect_cb);
+
+    /* Set the receive notify function. */
+    nxd_mqtt_client_receive_notify_set(&app_mqtt_client,
+                                       app_mqtt_received_cb);
+
+    /* Create an MQTT message received flag */
+    ret = tx_event_flags_create(&app_message_received_flag,
+                                "MQTT message received event");
+    if (ret != TX_SUCCESS)
+    {
+        Error_Handler();
+    }
+    /* Todo: Review how to handle error here? */
+    connect_to_broker();
+    tx_thread_resume(&app_telemetry_data_thread);
+    tx_thread_resume(&app_device_report_thread);
+    tx_thread_resume(&app_process_received_message_thread);
+    tx_thread_resume(&app_send_message_thread);
+
+    while (1)
+    {
+        if ((app_mqtt_client.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTED) &&
+            (app_mqtt_client.nxd_mqtt_client_state != NXD_MQTT_CLIENT_STATE_CONNECTING))
+        {
+            connect_to_broker();
+            // Check MQTT connection every 5s.
+            tx_thread_sleep(500);
+        }
+    }
+}
+
+static VOID app_link_check_thread_entry(ULONG thread_input)
+{
+    ULONG actual_status;
+    UINT status;
+    UINT link_status = APP_LINK_STATUS_UP;
+
+    while (1)
+    {
+        /* Send request to check if the Ethernet cable is connected. */
+        status = nx_ip_interface_status_check(&app_ip_instance, 0,
+                                              NX_IP_LINK_ENABLED,
+                                              &actual_status, 10);
+
+        if (status == NX_SUCCESS)
+        {
+            if (link_status == APP_LINK_STATUS_DOWN)
+            {
+                link_status = APP_LINK_STATUS_UP;
+
+                /* The network cable is connected. */
+                printf("The network cable is connected.\n");
+
+                /* Send request to enable PHY Link. */
+                nx_ip_driver_direct_command(&app_ip_instance,
+                                            NX_LINK_ENABLE,
+                                            &actual_status);
+
+                /* Send request to check if an address is resolved. */
+                status = nx_ip_interface_status_check(&app_ip_instance, 0,
+                                                      NX_IP_ADDRESS_RESOLVED,
+                                                      &actual_status, 10);
+                if (status == NX_SUCCESS)
+                {
+                    /* Stop DHCP */
+                    nx_dhcp_stop(&app_dhcp_client);
+
+                    /* Reinitialize DHCP */
+                    nx_dhcp_reinitialize(&app_dhcp_client);
+
+                    /* Start DHCP */
+                    nx_dhcp_start(&app_dhcp_client);
+
+                    /* Wait until an IP address is ready */
+                    if (tx_semaphore_get(&app_dhcp_semaphore,
+                                         TX_WAIT_FOREVER) != TX_SUCCESS)
+                    {
+                        Error_Handler();
+                    }
+                    PRINT_IP_ADDRESS(app_ip_address);
+                }
+                else
+                {
+                    /**
+                     *  Set the DHCP Client's remaining lease time to 0 seconds
+                     *  to trigger an immediate renewal request for a DHCP address.
+                     */
+                    nx_dhcp_client_update_time_remaining(&app_dhcp_client, 0);
+                }
+            }
         }
         else
         {
-          /* Set the DHCP Client's remaining lease time to 0 seconds to trigger an immediate renewal request for a DHCP address. */
-          nx_dhcp_client_update_time_remaining(&DHCPClient, 0);
+            if (link_status == APP_LINK_STATUS_UP)
+            {
+                link_status = APP_LINK_STATUS_DOWN;
+                /* The network cable is not connected. */
+                printf("The network cable is not connected.\n");
+                nx_ip_driver_direct_command(&app_ip_instance,
+                                            NX_LINK_DISABLE, &actual_status);
+            }
         }
-      }
+        tx_thread_sleep(APP_CABLE_CONNECTION_CHECK_PERIOD);
     }
-    else
-    {
-      if(0 == linkdown)
-      {
-        linkdown = 1;
-        /* The network cable is not connected. */
-        printf("The network cable is not connected.\n");
-        nx_ip_driver_direct_command(&NetXDuoEthIpInstance, NX_LINK_DISABLE,
-                                      &actual_status);
-      }
-    }
-
-    tx_thread_sleep(NX_APP_CABLE_CONNECTION_CHECK_PERIOD);
-  }
 }
-
-/* USER CODE END 2 */

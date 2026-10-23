@@ -19,7 +19,7 @@ The application then creates 3 threads with the different priorities:
 
 The **NxAppThread** starts and performs the following actions:
 
-  + Creates a dns_client with USER_DNS_ADDRESS (default value defined IP_ADDRESS(1, 1, 1, 1)) in app_netxduo.h.
+  + Creates a dns_client with APP_DNS_ADDRESS (default value defined IP_ADDRESS(1, 1, 1, 1)) in app_netxduo.h.
   + Starts the DHCP client
   + Waits for the IP address resolution
   + Resumes the **AppSNTPThread**
@@ -33,7 +33,7 @@ The **AppMQTTClientThread**, once started:
 
   + Creates an mqtt_client
   + Connects mqtt_client to the online MQTT broker; connection with server will be secure and a **tls_setup_callback** will set TLS parameters.
-    By default MQTT_PORT for encrypted mode is 8883.
+    By default APP_MQTT_PORT for encrypted mode is 8883.
 
           refer to note 4 below, to know how to setup an x509 certificate.
 
@@ -114,7 +114,7 @@ void MX_ETH_Init(void)
                        xxd.exe -i mosquitto.org.der > mosquitto.cert.h
 
       - add the converted file under the application : NetXDuo/Nx_MQTT_Client/NetXDuo/App
-      - configure MOSQUITTO_CERT_FILE with your certificate name.
+      - configure APP_BROKER_CERT_FILE with your certificate name.
 
 #### <b>ThreadX usage hints</b>
 
@@ -224,6 +224,6 @@ RTOS, Network, ThreadX, NetXDuo, MQTT, TLS, UART
 In order to make the program work, you must do the following :
 
  - Open your preferred toolchain
- - Edit the file app_netxduo.h : define the USER_DNS_ADDRESS (if necessary), the MQTT_BROKER_NAME and NB_MESSAGE.
+ - Edit the file app_netxduo.h : define the APP_DNS_ADDRESS (if necessary), the MQTT_BROKER_NAME and NB_MESSAGE.
  - Rebuild all files and load your image into target memory
  - Run the application

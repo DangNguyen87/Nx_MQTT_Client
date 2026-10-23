@@ -191,7 +191,7 @@ extern   "C" {
 
 
 #ifndef NX_SNTP_CLIENT_THREAD_PRIORITY                 
-#define NX_SNTP_CLIENT_THREAD_PRIORITY              12
+#define NX_SNTP_CLIENT_THREAD_PRIORITY              2
 #endif
 
 

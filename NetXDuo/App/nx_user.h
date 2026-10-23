@@ -973,9 +973,7 @@
 
 /* Priority of the DHCP thread. By default, this value specifies that the DHCP
    thread runs at priority 3. */
-/*
-#define NX_DHCP_THREAD_PRIORITY             3
-*/
+#define NX_DHCP_THREAD_PRIORITY             6
 
 /* Size of the DHCP thread stack. By default, the size is 4096 bytes. */
 /*
@@ -2013,9 +2011,7 @@
 
 /* This option sets the Client thread priority.
    The NetX Duo SNTP Client default value is 2. */
-/*
-#define NX_SNTP_CLIENT_THREAD_PRIORITY          2
-*/
+#define NX_SNTP_CLIENT_THREAD_PRIORITY          7
 
 /* This option sets the sets the level of priority at which the Client thread
    allows preemption. The default NetX Duo SNTP Client value is set to

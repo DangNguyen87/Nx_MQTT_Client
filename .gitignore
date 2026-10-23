@@ -2,3 +2,4 @@ STM32CubeIDE/.settings/
 STM32CubeIDE/Debug/
 STM32CubeIDE/Nx_MQTT_Client.launch
 STM32CubeIDE/Nx_MQTT_Client Debug.launch
+.vscode/

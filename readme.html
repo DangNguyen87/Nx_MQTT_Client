@@ -54,7 +54,7 @@ created with the <i>TX_DONT_START</i> flag to be started later.</li>
 <p>The <strong>NxAppThread</strong> starts and performs the following
 actions:</p>
 <ul>
-<li>Creates a dns_client with USER_DNS_ADDRESS (default value defined
+<li>Creates a dns_client with APP_DNS_ADDRESS (default value defined
 IP_ADDRESS(1, 1, 1, 1)) in app_netxduo.h.</li>
 <li>Starts the DHCP client</li>
 <li>Waits for the IP address resolution</li>
@@ -70,7 +70,7 @@ IP_ADDRESS(1, 1, 1, 1)) in app_netxduo.h.</li>
 <li><p>Creates an mqtt_client</p></li>
 <li><p>Connects mqtt_client to the online MQTT broker; connection with
 server will be secure and a <strong>tls_setup_callback</strong> will set
-TLS parameters. By default MQTT_PORT for encrypted mode is 8883.</p>
+TLS parameters. By default APP_MQTT_PORT for encrypted mode is 8883.</p>
 <pre><code>  refer to note 4 below, to know how to setup an x509 certificate.</code></pre></li>
 <li><p>mqtt_client subscribes on a predefined topic TOPIC_NAME
 “Temperature” with a Quality Of Service QOS0.</p></li>
@@ -180,7 +180,7 @@ from the file downloaded path :</p>
 <pre><code>           xxd.exe -i mosquitto.org.der &gt; mosquitto.cert.h</code></pre></li>
 <li><p>add the converted file under the application :
 NetXDuo/Nx_MQTT_Client/NetXDuo/App</p></li>
-<li><p>configure MOSQUITTO_CERT_FILE with your certificate
+<li><p>configure APP_BROKER_CERT_FILE with your certificate
 name.</p></li>
 </ul></li>
 </ol>
@@ -315,7 +315,7 @@ configuration is as follows:
 <p>In order to make the program work, you must do the following :</p>
 <ul>
 <li>Open your preferred toolchain</li>
-<li>Edit the file app_netxduo.h : define the USER_DNS_ADDRESS (if
+<li>Edit the file app_netxduo.h : define the APP_DNS_ADDRESS (if
 necessary), the MQTT_BROKER_NAME and NB_MESSAGE.</li>
 <li>Rebuild all files and load your image into target memory</li>
 <li>Run the application</li>
