@@ -16,6 +16,9 @@
  *         + NetX memory poll size
  *         + Ethernet descriptor size
  *     - Threads' priority
+ * 3. Create MAC address using STM32 UID to avoid address collision.
+ * 4. Review the usage of STM32 MPU, Flash/DTCM/ITCM memories,
+ *    cacheable and non-cacheable memory. Refer to README.md file.
  */
 #define PRINT_IP_ADDRESS(addr)                        \
     do                                                \
